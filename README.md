@@ -1,2 +1,1 @@
-# DriftFee
-Uniswap v4 hook that dynamically adjusts swap fees based on whether a trade pushes the pool price further away from, or back toward, its recent equilibrium. 
+Uniswap v4 hook that dynamically adjusts swap fees based on whether a trade pushes the pool price further away from, or back toward, its recent equilibrium.
