@@ -66,6 +66,9 @@ symmetrically, and have `beforeSwap`'s return path revert (or emit) when a hook 
 `BEFORE_SWAP_FLAG` returns a nonzero fee without the override bit set, rather than
 discarding it silently.
 
+Addressed in DriftFee's tests by reading the fee off the pool manager's own `Swap` event
+rather than trusting the hook's return value — see `test_swap_atEquilibrium_poolChargesBaseFee`.
+
 ### 5. Stale `SwapParams` import path across published examples
 
 Current v4-core defines `SwapParams` in `src/types/PoolOperation.sol`, but a large share of
@@ -73,3 +76,64 @@ published tutorials, blog posts, and generated code still use `IPoolManager.Swap
 The compiler error is clear once you hit it, but it makes nearly every external `beforeSwap`
 example non-compiling against current v4-core. A short "API changes since the v4 examples
 you may have read" section in the docs would help newcomers calibrate which guides are current.
+
+---
+
+## 2026-09-11 — Phase 2: writing and testing the hook
+
+### 6. A hook's own constructor validation is effectively untestable
+
+`BaseHook`'s constructor calls `_validateHookAddress(this)`, which compares the deployed
+address's low bits against `getHookPermissions()`. Base constructors run before the derived
+body, so `new MyHook(badArgs)` reverts with `HookAddressNotValid` at whatever address `create`
+happens to pick — the derived contract's own `revert InvalidParams()` is unreachable through
+`new`, at any address. A hook cannot unit-test its own constructor input validation the
+obvious way.
+
+The standard workaround, forge-std's `deployCodeTo`, does not help either: it wraps the
+deployment in `require(success, "StdCheats deployCodeTo(...): Failed to create runtime
+bytecode.")`, which discards the constructor's revert data. So you can observe *that* the
+constructor reverted but not *why*, and `vm.expectRevert(MyError.selector)` never matches.
+
+Getting a real assertion required hand-rolling the deployment: `vm.etch` the creation code
+plus ABI-encoded args to a flag-valid address, call it raw, and decode the returned revert
+data (`_assertConstructorReverts` in `test/DriftFee.t.sol`). That is a lot of ceremony for
+"check the constructor rejects bad parameters", and it is the kind of test most hook authors
+will simply skip. A `deployCodeTo` variant that bubbles constructor revert data would fix this
+for every hook project, not just this one.
+
+### 7. Two OpenZeppelin conventions collide: coverage stubs become fuzz targets
+
+uniswap-hooks marks mocks with an empty `function test() public {}` so `forge coverage`
+excludes them. Reasonable in isolation. But an invariant handler is also a contract you pass
+to `targetContract()`, and the fuzzer targets *all* public functions by default — so the
+coverage stub becomes a fuzz target. In the first run of DriftFee's invariant suite, 666 of
+2048 calls went to `test()`, silently burning a third of the budget on a no-op.
+
+Nothing surfaces this except reading the per-selector call table and noticing a selector that
+shouldn't be there. `targetSelector` fixes it, but you have to know to look. Worth a note in
+the invariant-testing docs: if a handler carries a coverage-exclusion stub, restrict selectors
+explicitly.
+
+### 8. Transitive remapping paths do not match the directory tree
+
+`MockERC20` is imported from `solmate/src/test/utils/mocks/MockERC20.sol`. The remapping is
+`solmate/=lib/uniswap-hooks/lib/v4-core/lib/solmate/`, so the `src/` in the middle of the
+import path is part of solmate's own layout, not something `forge remappings` shows you. The
+natural guess — `solmate/test/utils/mocks/MockERC20.sol`, mirroring what the directory listing
+suggests — fails with a bare "File not found".
+
+The fix is to grep an existing v4-core test for the import and copy it. That works, but it
+means the practical way to discover an import path in this dependency tree is imitation rather
+than inspection. Combined with entry 2 (two copies of v4-core at different commits), imports
+are the single largest papercut in v4 hook development so far.
+
+### 9. `forge lint` has no expression-level suppression for provably-safe casts
+
+Arithmetic on bounded values produces `unsafe-typecast` warnings even where the bound is
+established a few lines earlier and the cast cannot truncate (e.g. casting a value already
+clamped to `maxFee`, itself a `uint24`, back to `uint24`). Suppression is line-level only, so
+a line containing two casts cannot have one justified and the other left flagged, and the
+`// forge-lint: disable-next-line(...)` comments end up outnumbering the code they annotate.
+Warnings are correct to raise by default; an expression-level opt-out would let a project keep
+a genuinely clean lint baseline instead of learning to ignore its own output.
