@@ -47,8 +47,10 @@ import {BaseHook} from "uniswap-hooks/base/BaseHook.sol";
  *
  * ## Trust surface
  *
- * Parameters are owner-controlled, but every fee the owner can configure is hard-capped at
- * {MAX_CONFIGURABLE_FEE}, so the owner cannot raise fees to an extractive level on pools that have
+ * Parameters are owner-controlled, per pool with a global default, but every fee the owner can
+ * configure is hard-capped at {MAX_CONFIGURABLE_FEE} and every window is floored at
+ * {MIN_REFERENCE_WINDOW}. The owner can therefore tune a pool to its pair, but cannot raise fees to
+ * an extractive level, nor shorten a reference window into manipulability, on pools that have
  * already opted in.
  *
  * NOTE: no reentrancy guard is applied. The hook entry points are `onlyPoolManager`, hold no funds,
@@ -116,7 +118,12 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         bool initialized;
     }
 
-    Params private _params;
+    /// @dev Curve applied to any pool without an override.
+    Params private _defaultCurve;
+
+    /// @dev Per-pool curve overrides. A `referenceWindow` of zero means "no override", which is
+    /// unambiguous because {_validatedParams} floors every stored window at {MIN_REFERENCE_WINDOW}.
+    mapping(PoolId id => Params curve) private _poolCurves;
 
     mapping(PoolId id => DriftState state) private _driftStates;
 
@@ -130,8 +137,14 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
     /// whether the swap increases absolute drift.
     event DriftFeeApplied(PoolId indexed id, int24 drift, uint24 fee, bool movingAway);
 
-    /// @dev The fee curve was reconfigured.
-    event ParamsUpdated(Params params);
+    /// @dev The default fee curve was reconfigured.
+    event DefaultParamsUpdated(Params params);
+
+    /// @dev `id` was given its own fee curve, overriding the default.
+    event PoolParamsUpdated(PoolId indexed id, Params params);
+
+    /// @dev `id` reverted to the default fee curve.
+    event PoolParamsCleared(PoolId indexed id);
 
     /// @dev A parameter was outside its permitted range, or the curve was internally inconsistent.
     error InvalidParams();
@@ -141,20 +154,33 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
 
     /**
      * @param _poolManager The v4 pool manager singleton.
-     * @param initialOwner Account permitted to reconfigure the fee curve.
-     * @param initialParams Initial fee curve, validated by {_setParams}.
+     * @param initialOwner Account permitted to reconfigure fee curves.
+     * @param initialParams Initial default fee curve, validated by {_validatedParams}.
      */
     constructor(IPoolManager _poolManager, address initialOwner, Params memory initialParams)
         BaseHook(_poolManager)
         Ownable(initialOwner)
     {
         if (address(_poolManager) == address(0)) revert InvalidPoolManager();
-        _setParams(initialParams);
+
+        _defaultCurve = _validatedParams(initialParams);
+
+        emit DefaultParamsUpdated(initialParams);
     }
 
-    /// @notice The active fee curve.
-    function params() external view returns (Params memory) {
-        return _params;
+    /// @notice The curve applied to pools without an override.
+    function defaultParams() external view returns (Params memory) {
+        return _defaultCurve;
+    }
+
+    /// @notice The curve actually applied to `key`, whether that is its override or the default.
+    function paramsFor(PoolKey calldata key) external view returns (Params memory) {
+        return _effectiveParams(key.toId());
+    }
+
+    /// @notice Whether `key` has a curve of its own.
+    function hasPoolParams(PoolKey calldata key) external view returns (bool) {
+        return _poolCurves[key.toId()].referenceWindow != 0;
     }
 
     /**
@@ -183,17 +209,46 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         PoolId id = key.toId();
         (, int24 currentTick,,) = poolManager.getSlot0(id);
 
+        Params memory p = _effectiveParams(id);
+
         DriftState storage state = _driftStates[id];
         int256 referenceScaled = state.initialized
-            ? _foldedReference(state, currentTick, _params.referenceWindow)
+            ? _foldedReference(state, currentTick, p.referenceWindow)
             : int256(currentTick) * TICK_SCALE;
 
-        (fee,,) = _feeFor(referenceScaled, currentTick, zeroForOne);
+        (fee,,) = _feeFor(p, referenceScaled, currentTick, zeroForOne);
     }
 
-    /// @notice Reconfigure the fee curve.
-    function setParams(Params calldata newParams) external onlyOwner {
-        _setParams(newParams);
+    /// @notice Reconfigure the curve used by pools without an override.
+    function setDefaultParams(Params calldata newParams) external onlyOwner {
+        _defaultCurve = _validatedParams(newParams);
+
+        emit DefaultParamsUpdated(newParams);
+    }
+
+    /**
+     * @notice Give `key` a curve of its own.
+     *
+     * @dev A volatile pair and a stablecoin pair want very different drift sensitivity and window
+     * lengths, so one curve across every pool would mean mispricing all but one of them. Overrides
+     * are validated against the same hard caps as the default, so per-pool tuning cannot be used to
+     * exceed {MAX_CONFIGURABLE_FEE} or to drop below {MIN_REFERENCE_WINDOW}.
+     */
+    function setPoolParams(PoolKey calldata key, Params calldata newParams) external onlyOwner {
+        PoolId id = key.toId();
+
+        _poolCurves[id] = _validatedParams(newParams);
+
+        emit PoolParamsUpdated(id, newParams);
+    }
+
+    /// @notice Return `key` to the default curve.
+    function clearPoolParams(PoolKey calldata key) external onlyOwner {
+        PoolId id = key.toId();
+
+        delete _poolCurves[id];
+
+        emit PoolParamsCleared(id);
     }
 
     /// @dev Seed the pool's equilibrium at the price it was initialized at, in addition to the
@@ -227,13 +282,21 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         PoolId id = key.toId();
         (, int24 currentTick,,) = poolManager.getSlot0(id);
 
-        int256 referenceScaled = _updateReference(id, currentTick);
+        Params memory p = _effectiveParams(id);
+        int256 referenceScaled = _updateReference(id, currentTick, p.referenceWindow);
 
         int24 drift;
         bool movingAway;
-        (fee, drift, movingAway) = _feeFor(referenceScaled, currentTick, swapParams.zeroForOne);
+        (fee, drift, movingAway) = _feeFor(p, referenceScaled, currentTick, swapParams.zeroForOne);
 
         emit DriftFeeApplied(id, drift, fee, movingAway);
+    }
+
+    /// @dev The curve applied to `id`: its override if it has one, otherwise the default.
+    function _effectiveParams(PoolId id) internal view returns (Params memory) {
+        Params memory p = _poolCurves[id];
+
+        return p.referenceWindow == 0 ? _defaultCurve : p;
     }
 
     /**
@@ -241,14 +304,16 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
      *
      * @return referenceScaled The reference after folding, scaled by {TICK_SCALE}.
      */
-    function _updateReference(PoolId id, int24 currentTick) private returns (int256 referenceScaled) {
+    function _updateReference(PoolId id, int24 currentTick, uint32 window) private returns (int256 referenceScaled) {
         DriftState storage state = _driftStates[id];
 
-        // A pool can only reach `beforeSwap` through `afterInitialize`, but seed defensively so a
-        // missing reference can never be read as tick 0, i.e. a 1:1 price.
+        // Unreachable in v4: the hook address is part of `PoolKey`, so any pool using this hook must
+        // have passed through `afterInitialize`, which seeds. Kept because the failure mode if that
+        // ever stopped holding is severe and silent — an unseeded `DriftState` reads as tick 0, a
+        // 1:1 price, which would price every swap against a fabricated equilibrium. This is the one
+        // branch the test suite deliberately leaves uncovered.
         if (!state.initialized) return _seedReference(id, currentTick);
 
-        uint32 window = _params.referenceWindow;
         referenceScaled = _foldedReference(state, currentTick, window);
 
         // `lastUpdate` differing from now is exactly the condition under which the fold above
@@ -321,13 +386,11 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
      * @return drift Signed distance from equilibrium in ticks, truncated toward zero.
      * @return movingAway Whether the swap increases absolute drift.
      */
-    function _feeFor(int256 referenceScaled, int24 currentTick, bool zeroForOne)
+    function _feeFor(Params memory p, int256 referenceScaled, int24 currentTick, bool zeroForOne)
         internal
-        view
+        pure
         returns (uint24 fee, int24 drift, bool movingAway)
     {
-        Params memory p = _params;
-
         int256 driftScaled = int256(currentTick) * TICK_SCALE - referenceScaled;
         drift = (driftScaled / TICK_SCALE).toInt24();
 
@@ -360,8 +423,14 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         }
     }
 
-    /// @dev Validate and store a fee curve.
-    function _setParams(Params memory newParams) private {
+    /**
+     * @dev Validate a fee curve, returning it so callers can assign it to the default or to a pool.
+     *
+     * Every caller routes through here, so the hard caps hold for per-pool overrides exactly as they
+     * do for the default, and a stored `referenceWindow` is always nonzero — which is what lets zero
+     * serve as the "no override" sentinel in {_poolCurves}.
+     */
+    function _validatedParams(Params memory newParams) private pure returns (Params memory) {
         if (
             newParams.minFee > newParams.baseFee || newParams.baseFee > newParams.maxFee
                 || newParams.maxFee > MAX_CONFIGURABLE_FEE || newParams.feePerTick > MAX_FEE_PER_TICK
@@ -371,8 +440,6 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
             revert InvalidParams();
         }
 
-        _params = newParams;
-
-        emit ParamsUpdated(newParams);
+        return newParams;
     }
 }

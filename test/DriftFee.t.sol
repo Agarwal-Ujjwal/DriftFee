@@ -129,7 +129,7 @@ contract DriftFeeTest is Test, Deployers {
     function test_setParams_nonOwner_reverts() public {
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        hook.setParams(_defaultParams());
+        hook.setDefaultParams(_defaultParams());
     }
 
     function test_setParams_owner_updatesAndEmits() public {
@@ -138,13 +138,13 @@ contract DriftFeeTest is Test, Deployers {
         next.feePerTick = 50;
 
         vm.expectEmit(address(hook));
-        emit DriftFee.ParamsUpdated(next);
+        emit DriftFee.DefaultParamsUpdated(next);
 
         vm.prank(owner);
-        hook.setParams(next);
+        hook.setDefaultParams(next);
 
-        assertEq(hook.params().baseFee, 4000);
-        assertEq(hook.params().feePerTick, 50);
+        assertEq(hook.defaultParams().baseFee, 4000);
+        assertEq(hook.defaultParams().feePerTick, 50);
     }
 
     function test_setParams_feeAboveHardCap_reverts() public {
@@ -153,7 +153,7 @@ contract DriftFeeTest is Test, Deployers {
 
         vm.prank(owner);
         vm.expectRevert(DriftFee.InvalidParams.selector);
-        hook.setParams(bad);
+        hook.setDefaultParams(bad);
     }
 
     function test_setParams_windowBelowFloor_reverts() public {
@@ -162,7 +162,7 @@ contract DriftFeeTest is Test, Deployers {
 
         vm.prank(owner);
         vm.expectRevert(DriftFee.InvalidParams.selector);
-        hook.setParams(bad);
+        hook.setDefaultParams(bad);
     }
 
     function test_setParams_windowAboveCeiling_reverts() public {
@@ -171,7 +171,7 @@ contract DriftFeeTest is Test, Deployers {
 
         vm.prank(owner);
         vm.expectRevert(DriftFee.InvalidParams.selector);
-        hook.setParams(bad);
+        hook.setDefaultParams(bad);
     }
 
     function test_setParams_inconsistentCurve_reverts() public {
@@ -180,7 +180,7 @@ contract DriftFeeTest is Test, Deployers {
 
         vm.prank(owner);
         vm.expectRevert(DriftFee.InvalidParams.selector);
-        hook.setParams(bad);
+        hook.setDefaultParams(bad);
     }
 
     function test_setParams_discountAboveOneHundredPercent_reverts() public {
@@ -189,7 +189,7 @@ contract DriftFeeTest is Test, Deployers {
 
         vm.prank(owner);
         vm.expectRevert(DriftFee.InvalidParams.selector);
-        hook.setParams(bad);
+        hook.setDefaultParams(bad);
     }
 
     function test_setParams_feePerTickAboveCap_reverts() public {
@@ -198,7 +198,128 @@ contract DriftFeeTest is Test, Deployers {
 
         vm.prank(owner);
         vm.expectRevert(DriftFee.InvalidParams.selector);
-        hook.setParams(bad);
+        hook.setDefaultParams(bad);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          PER-POOL OVERRIDES
+    //////////////////////////////////////////////////////////////*/
+
+    function test_poolParams_defaultAppliesWhenUnset() public view {
+        assertFalse(hook.hasPoolParams(key));
+        assertEq(hook.paramsFor(key).baseFee, _defaultParams().baseFee);
+        assertEq(hook.paramsFor(key).referenceWindow, _defaultParams().referenceWindow);
+    }
+
+    function test_setPoolParams_nonOwner_reverts() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        hook.setPoolParams(key, _defaultParams());
+    }
+
+    function test_clearPoolParams_nonOwner_reverts() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        hook.clearPoolParams(key);
+    }
+
+    function test_setPoolParams_overridesTheDefault() public {
+        DriftFee.Params memory tight = _defaultParams();
+        tight.baseFee = 100; // a stablecoin-style curve
+        tight.minFee = 10;
+        tight.feePerTick = 200;
+
+        vm.expectEmit(address(hook));
+        emit DriftFee.PoolParamsUpdated(key.toId(), tight);
+
+        vm.prank(owner);
+        hook.setPoolParams(key, tight);
+
+        assertTrue(hook.hasPoolParams(key));
+        assertEq(hook.paramsFor(key).baseFee, 100);
+        assertEq(hook.defaultParams().baseFee, _defaultParams().baseFee, "default must be untouched");
+
+        // The pool charges its own curve, not the default.
+        assertEq(_swapAndReadPoolFee(true, 1e15), 100);
+    }
+
+    function test_clearPoolParams_revertsToDefault() public {
+        DriftFee.Params memory tight = _defaultParams();
+        tight.baseFee = 100;
+        tight.minFee = 10;
+
+        vm.prank(owner);
+        hook.setPoolParams(key, tight);
+
+        vm.expectEmit(address(hook));
+        emit DriftFee.PoolParamsCleared(key.toId());
+
+        vm.prank(owner);
+        hook.clearPoolParams(key);
+
+        assertFalse(hook.hasPoolParams(key));
+        assertEq(hook.paramsFor(key).baseFee, _defaultParams().baseFee);
+    }
+
+    /// @dev An override must not be a way around the caps that bound the default curve, or per-pool
+    /// tuning would become a path to an extractive fee.
+    function test_setPoolParams_hardCapsStillApply() public {
+        DriftFee.Params memory overCap = _defaultParams();
+        overCap.maxFee = hook.MAX_CONFIGURABLE_FEE() + 1;
+
+        vm.prank(owner);
+        vm.expectRevert(DriftFee.InvalidParams.selector);
+        hook.setPoolParams(key, overCap);
+
+        DriftFee.Params memory shortWindow = _defaultParams();
+        shortWindow.referenceWindow = hook.MIN_REFERENCE_WINDOW() - 1;
+
+        vm.prank(owner);
+        vm.expectRevert(DriftFee.InvalidParams.selector);
+        hook.setPoolParams(key, shortWindow);
+    }
+
+    function test_setPoolParams_affectsOnlyThatPool() public {
+        // Same pair, different tick spacing, so a genuinely different pool id.
+        (PoolKey memory otherKey,) =
+            initPool(currency0, currency1, IHooks(address(hook)), LPFeeLibrary.DYNAMIC_FEE_FLAG, 30, SQRT_PRICE_1_1);
+
+        DriftFee.Params memory tight = _defaultParams();
+        tight.baseFee = 100;
+        tight.minFee = 10;
+
+        vm.prank(owner);
+        hook.setPoolParams(key, tight);
+
+        assertEq(hook.paramsFor(key).baseFee, 100);
+        assertEq(hook.paramsFor(otherKey).baseFee, _defaultParams().baseFee, "sibling pool should be unaffected");
+        assertFalse(hook.hasPoolParams(otherKey));
+    }
+
+    /// @dev A longer override window is the point of per-pool tuning: the same price move drags
+    /// equilibrium less on a pool configured to trust its reference for longer.
+    function test_setPoolParams_longerWindowFoldsSlower() public {
+        DriftFee.Params memory slow = _defaultParams();
+        slow.referenceWindow = 18_000; // ten times the default
+
+        vm.prank(owner);
+        hook.setPoolParams(key, slow);
+
+        _swap(true, 1e16);
+        (, int24 standingTick,,) = manager.getSlot0(key.toId());
+
+        vm.warp(block.timestamp + 180);
+        vm.roll(block.number + 1);
+        _swap(true, 1);
+
+        (int24 referenceAfter,,) = hook.driftState(key);
+
+        assertEq(referenceAfter, int24(hook.fold(0, standingTick, 180, 18_000) / 1e6));
+        assertGt(
+            referenceAfter,
+            int24(hook.fold(0, standingTick, 180, 1800) / 1e6),
+            "the slower window should have moved equilibrium less"
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -206,8 +327,8 @@ contract DriftFeeTest is Test, Deployers {
     //////////////////////////////////////////////////////////////*/
 
     function test_feeFor_atEquilibrium_isBaseFee() public view {
-        (uint24 feeUp, int24 drift, bool movingAway) = hook.feeFor(0, 0, false);
-        (uint24 feeDown,,) = hook.feeFor(0, 0, true);
+        (uint24 feeUp, int24 drift, bool movingAway) = hook.feeFor(key, 0, 0, false);
+        (uint24 feeDown,,) = hook.feeFor(key, 0, 0, true);
 
         assertEq(feeUp, _defaultParams().baseFee);
         assertEq(feeDown, _defaultParams().baseFee);
@@ -219,7 +340,7 @@ contract DriftFeeTest is Test, Deployers {
         DriftFee.Params memory p = _defaultParams();
 
         // Pool 50 ticks above equilibrium, swap pushes the tick up again.
-        (uint24 fee, int24 drift, bool movingAway) = hook.feeFor(0, 50, false);
+        (uint24 fee, int24 drift, bool movingAway) = hook.feeFor(key, 0, 50, false);
 
         assertTrue(movingAway);
         assertEq(drift, 50);
@@ -230,7 +351,7 @@ contract DriftFeeTest is Test, Deployers {
         DriftFee.Params memory p = _defaultParams();
 
         // Pool 50 ticks above equilibrium, swap pushes the tick back down.
-        (uint24 fee, int24 drift, bool movingAway) = hook.feeFor(0, 50, true);
+        (uint24 fee, int24 drift, bool movingAway) = hook.feeFor(key, 0, 50, true);
 
         assertFalse(movingAway);
         assertEq(drift, 50);
@@ -238,22 +359,22 @@ contract DriftFeeTest is Test, Deployers {
     }
 
     function test_feeFor_isSymmetricBelowEquilibrium() public view {
-        (uint24 awayAbove,,) = hook.feeFor(0, 50, false);
-        (uint24 awayBelow,,) = hook.feeFor(0, -50, true);
-        (uint24 towardAbove,,) = hook.feeFor(0, 50, true);
-        (uint24 towardBelow,,) = hook.feeFor(0, -50, false);
+        (uint24 awayAbove,,) = hook.feeFor(key, 0, 50, false);
+        (uint24 awayBelow,,) = hook.feeFor(key, 0, -50, true);
+        (uint24 towardAbove,,) = hook.feeFor(key, 0, 50, true);
+        (uint24 towardBelow,,) = hook.feeFor(key, 0, -50, false);
 
         assertEq(awayAbove, awayBelow, "surcharge should not depend on the sign of drift");
         assertEq(towardAbove, towardBelow, "discount should not depend on the sign of drift");
     }
 
     function test_feeFor_clampsAtMaxFee() public view {
-        (uint24 fee,,) = hook.feeFor(0, 2000, false);
+        (uint24 fee,,) = hook.feeFor(key, 0, 2000, false);
         assertEq(fee, _defaultParams().maxFee);
     }
 
     function test_feeFor_clampsAtMinFee() public view {
-        (uint24 fee,,) = hook.feeFor(0, 2000, true);
+        (uint24 fee,,) = hook.feeFor(key, 0, 2000, true);
         assertEq(fee, _defaultParams().minFee);
     }
 
@@ -262,7 +383,7 @@ contract DriftFeeTest is Test, Deployers {
 
         // Reference half a tick below the current tick: drift truncates to 0 ticks, but the
         // adjustment is computed on the scaled value so half a tick of drift still prices.
-        (uint24 fee, int24 drift,) = hook.feeFor(-5e5, 0, false);
+        (uint24 fee, int24 drift,) = hook.feeFor(key, -5e5, 0, false);
 
         assertEq(drift, 0, "sub-tick drift truncates in the reported value");
         assertEq(fee, p.baseFee + p.feePerTick / 2, "sub-tick drift should still move the fee");
@@ -273,9 +394,9 @@ contract DriftFeeTest is Test, Deployers {
         p.discountBps = 5000; // credit only half the adjustment back
 
         vm.prank(owner);
-        hook.setParams(p);
+        hook.setDefaultParams(p);
 
-        (uint24 fee,,) = hook.feeFor(0, 50, true);
+        (uint24 fee,,) = hook.feeFor(key, 0, 50, true);
         assertEq(fee, p.baseFee - (50 * p.feePerTick) / 2);
     }
 
@@ -450,15 +571,13 @@ contract DriftFeeTest is Test, Deployers {
         uint24 feePerTick,
         uint24 maxAdjustment,
         uint16 discountBps
-    ) public {
-        DriftFee.Params memory p = _setBoundedParams(
-            baseFee, minFee, maxFee, feePerTick, maxAdjustment, discountBps, 1800
-        );
+    ) public view {
+        DriftFee.Params memory p = _boundedParams(baseFee, minFee, maxFee, feePerTick, maxAdjustment, discountBps, 1800);
 
         referenceTick = _boundTick(referenceTick);
         currentTick = _boundTick(currentTick);
 
-        (uint24 fee,,) = hook.feeFor(int256(referenceTick) * 1e6, currentTick, zeroForOne);
+        (uint24 fee,,) = hook.feeForParams(p, int256(referenceTick) * 1e6, currentTick, zeroForOne);
 
         assertGe(fee, p.minFee, "fee below floor");
         assertLe(fee, p.maxFee, "fee above ceiling");
@@ -471,7 +590,7 @@ contract DriftFeeTest is Test, Deployers {
         referenceTick = _boundTick(referenceTick);
         currentTick = _boundTick(currentTick);
 
-        (uint24 fee,, bool movingAway) = hook.feeFor(int256(referenceTick) * 1e6, currentTick, zeroForOne);
+        (uint24 fee,, bool movingAway) = hook.feeFor(key, int256(referenceTick) * 1e6, currentTick, zeroForOne);
         uint24 baseFee = _defaultParams().baseFee;
 
         if (movingAway) {
@@ -486,10 +605,10 @@ contract DriftFeeTest is Test, Deployers {
         int24 small = int24(uint24(bound(smallDrift, 0, 100_000)));
         int24 large = small + int24(uint24(bound(extraDrift, 0, 100_000)));
 
-        (uint24 awaySmall,,) = hook.feeFor(0, small, false);
-        (uint24 awayLarge,,) = hook.feeFor(0, large, false);
-        (uint24 towardSmall,,) = hook.feeFor(0, small, true);
-        (uint24 towardLarge,,) = hook.feeFor(0, large, true);
+        (uint24 awaySmall,,) = hook.feeFor(key, 0, small, false);
+        (uint24 awayLarge,,) = hook.feeFor(key, 0, large, false);
+        (uint24 towardSmall,,) = hook.feeFor(key, 0, small, true);
+        (uint24 towardLarge,,) = hook.feeFor(key, 0, large, true);
 
         assertGe(awayLarge, awaySmall, "surcharge should not fall as drift grows");
         assertLe(towardLarge, towardSmall, "discount should not shrink as drift grows");
@@ -498,16 +617,14 @@ contract DriftFeeTest is Test, Deployers {
     /// @dev The core economic invariant. Pushing the price away and then reverting it can never
     /// cost less in total than two swaps at the floor fee, so a manipulation round trip cannot be
     /// funded by the discount it creates.
-    function testFuzz_roundTripNeverRebates(int24 driftTick, uint16 discountBps) public {
+    function testFuzz_roundTripNeverRebates(int24 driftTick, uint16 discountBps) public view {
         DriftFee.Params memory p = _defaultParams();
         p.discountBps = uint16(bound(discountBps, 0, 10_000));
-        vm.prank(owner);
-        hook.setParams(p);
 
         int24 drift = _boundTick(driftTick);
 
-        (uint24 awayFee,,) = hook.feeFor(0, drift, drift >= 0 ? false : true);
-        (uint24 towardFee,,) = hook.feeFor(0, drift, drift >= 0 ? true : false);
+        (uint24 awayFee,,) = hook.feeForParams(p, 0, drift, drift >= 0 ? false : true);
+        (uint24 towardFee,,) = hook.feeForParams(p, 0, drift, drift >= 0 ? true : false);
 
         assertGe(uint256(awayFee) + towardFee, uint256(p.minFee) * 2, "round trip must not be free");
         assertGe(awayFee, towardFee, "the reverting leg must never cost more than the pushing leg");
@@ -581,7 +698,9 @@ contract DriftFeeTest is Test, Deployers {
         return int24(bound(int256(tick), -887_000, 887_000));
     }
 
-    function _setBoundedParams(
+    /// @dev Reshape fuzzed inputs into a curve `_validatedParams` would accept, so the fuzz only
+    /// covers configurations the contract can actually be put into.
+    function _boundedParams(
         uint24 baseFee,
         uint24 minFee,
         uint24 maxFee,
@@ -589,7 +708,7 @@ contract DriftFeeTest is Test, Deployers {
         uint24 maxAdjustment,
         uint16 discountBps,
         uint32 referenceWindow
-    ) private returns (DriftFee.Params memory p) {
+    ) private view returns (DriftFee.Params memory p) {
         uint24 cap = hook.MAX_CONFIGURABLE_FEE();
 
         p.minFee = uint24(bound(minFee, 0, cap));
@@ -599,9 +718,6 @@ contract DriftFeeTest is Test, Deployers {
         p.maxAdjustment = uint24(bound(maxAdjustment, 0, cap));
         p.discountBps = uint16(bound(discountBps, 0, 10_000));
         p.referenceWindow = uint32(bound(referenceWindow, hook.MIN_REFERENCE_WINDOW(), hook.MAX_REFERENCE_WINDOW()));
-
-        vm.prank(owner);
-        hook.setParams(p);
     }
 
     function _swap(bool zeroForOne, int256 amount) private {

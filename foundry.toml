@@ -9,6 +9,9 @@ optimizer_runs = 200
 ffi = true
 fs_permissions = [{ access = "read", path = "./" }]
 
+[rpc_endpoints]
+mainnet = "${MAINNET_RPC_URL}"
+
 [fuzz]
 runs = 1000
 

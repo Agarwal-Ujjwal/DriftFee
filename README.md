@@ -48,9 +48,15 @@ Both halves of that argument are fuzzed as invariants — see `testFuzz_roundTri
 | `discountBps`     | Share of the adjustment credited back to drift-reducing swaps    | 100%    |
 | `referenceWindow` | Time constant of the equilibrium average                         | 30 min  |
 
-Parameters are owner-controlled, but every configurable fee is hard-capped at
-`MAX_CONFIGURABLE_FEE` (10%), so the owner cannot raise fees to an extractive level on pools that
-have already opted in. `referenceWindow` is likewise floored at 30 minutes.
+Curves are set **per pool, over a global default**. A volatile ETH pair and a stablecoin pair want
+very different drift sensitivity and window lengths, so a single curve across every pool would mean
+mispricing all but one of them. `setPoolParams` overrides a pool; `clearPoolParams` returns it to the
+default.
+
+Both paths validate against the same hard caps: every configurable fee is capped at
+`MAX_CONFIGURABLE_FEE` (10%) and every `referenceWindow` is floored at 30 minutes. So the owner can
+tune a pool to its pair, but cannot raise fees to an extractive level — nor shorten a window into
+manipulability — on pools that have already opted in.
 
 Pools must be initialized with `LPFeeLibrary.DYNAMIC_FEE_FLAG`; `afterInitialize` rejects anything
 else and seeds equilibrium at the initialization tick.
@@ -61,6 +67,7 @@ else and seeds equilibrium at the initialization tick.
 src/DriftFee.sol                  the hook
 test/DriftFee.t.sol               unit + fuzz tests
 test/DriftFee.invariants.t.sol    handler-driven invariants
+test/DriftFee.fork.t.sol          against the deployed mainnet PoolManager and real USDC/WETH
 test/utils/DriftFeeHarness.sol    exposes the fee curve and fold for direct fuzzing
 test/utils/DriftFeeHandler.sol    random swap/time sequences for the invariant runner
 FEEDBACK.md                       running log of v4 development friction
@@ -71,11 +78,36 @@ FEEDBACK.md                       running log of v4 development friction
 ```sh
 forge build
 forge test
-FOUNDRY_PROFILE=deep forge test    # 10k fuzz runs, 256 invariant runs
+FOUNDRY_PROFILE=deep forge test              # 10k fuzz runs, 256 invariant runs
+forge test --no-match-path 'test/*.fork.t.sol'   # skip the network
 ```
 
 `foundry.toml` pins `solc 0.8.26` and `evm_version = "cancun"` to match the v4 stack. Both pins are
 load-bearing — see `FEEDBACK.md`.
+
+### Fork tests
+
+The fork suite creates a fresh USDC/WETH pool on the **deployed** mainnet `PoolManager`
+(`0x0000...8A90`, verified onchain) and trades against it. It covers two things the unit tests
+structurally cannot:
+
+- that the real manager honours the override fee. The unit suite compiles its own `PoolManager` from
+  vendored v4-core, at a *different commit* than what is deployed — and a hook that fails to
+  override looks perfectly healthy while charging nothing (`FEEDBACK.md` entry 4).
+- that the drift math holds on a 6-decimal/18-decimal pair at a realistic price. Every unit test runs
+  at tick 0 on two 18-decimal mocks, which is exactly where a decimals bug hides.
+
+It runs against the latest block, so no archive node is needed, and **skips rather than fails** when
+no RPC is reachable:
+
+```sh
+forge test --match-path 'test/*.fork.t.sol'           # uses a public endpoint
+MAINNET_RPC_URL=<url> forge test --match-path 'test/*.fork.t.sol'
+FORK_BLOCK=25956318 forge test --match-path 'test/*.fork.t.sol'   # pin for reproducibility
+```
+
+CI runs the fork suite as a separate, non-blocking job, so a third-party RPC outage cannot redden a
+PR that broke nothing.
 
 ## Status
 
