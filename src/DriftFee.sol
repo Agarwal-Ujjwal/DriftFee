@@ -207,6 +207,8 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
      */
     function quoteFee(PoolKey calldata key, bool zeroForOne) external view returns (uint24 fee) {
         PoolId id = key.toId();
+        // Only the tick is needed; the other `slot0` fields are deliberately discarded.
+        // slither-disable-next-line unused-return
         (, int24 currentTick,,) = poolManager.getSlot0(id);
 
         Params memory p = _effectiveParams(id);
@@ -280,6 +282,8 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         returns (uint24 fee)
     {
         PoolId id = key.toId();
+        // Only the tick is needed; the other `slot0` fields are deliberately discarded.
+        // slither-disable-next-line unused-return
         (, int24 currentTick,,) = poolManager.getSlot0(id);
 
         Params memory p = _effectiveParams(id);
@@ -402,19 +406,28 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         movingAway = (driftScaled > 0) == !zeroForOne;
 
         uint256 absDriftScaled = uint256(driftScaled > 0 ? driftScaled : -driftScaled);
+
         // Casting {TICK_SCALE} is safe because it is a positive constant.
         // forge-lint: disable-next-line(unsafe-typecast)
-        uint256 adjustment = (absDriftScaled * p.feePerTick) / uint256(TICK_SCALE);
-        if (adjustment > p.maxAdjustment) adjustment = p.maxAdjustment;
+        uint256 scale = uint256(TICK_SCALE);
+
+        // The adjustment stays in scaled units until the last possible step, so every
+        // multiplication happens before any division. Dividing down to whole hundredths of a bip
+        // first and only then applying `discountBps` would discard up to a full unit of the
+        // discount. Bounded comfortably inside `uint256`: absolute drift cannot exceed ~1.8e6
+        // ticks, so the widest intermediate below peaks around 1.8e19.
+        uint256 adjustmentScaled = absDriftScaled * p.feePerTick;
+        uint256 maxAdjustmentScaled = uint256(p.maxAdjustment) * scale;
+        if (adjustmentScaled > maxAdjustmentScaled) adjustmentScaled = maxAdjustmentScaled;
 
         if (movingAway) {
-            uint256 surcharged = uint256(p.baseFee) + adjustment;
+            uint256 surcharged = uint256(p.baseFee) + adjustmentScaled / scale;
             // Casting to `uint24` is safe because the branch is only taken when `surcharged` is at
             // most `maxFee`, itself a `uint24`.
             // forge-lint: disable-next-line(unsafe-typecast)
             fee = surcharged > p.maxFee ? p.maxFee : uint24(surcharged);
         } else {
-            uint256 discount = (adjustment * p.discountBps) / BPS_DENOMINATOR;
+            uint256 discount = (adjustmentScaled * p.discountBps) / (scale * BPS_DENOMINATOR);
             uint256 headroom = uint256(p.baseFee) - p.minFee;
             // Casting to `uint24` is safe because the branch is only taken when `discount` is below
             // `headroom`, leaving a result strictly between `minFee` and `baseFee`.

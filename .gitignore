@@ -2,6 +2,10 @@
 cache/
 out/
 
+# Static analysis tooling (local venv, see FEEDBACK.md)
+.venv-slither/
+crytic-export/
+
 # Commonly ignored directories
 .logs/
 .ignore/

@@ -389,6 +389,28 @@ contract DriftFeeTest is Test, Deployers {
         assertEq(fee, p.baseFee + p.feePerTick / 2, "sub-tick drift should still move the fee");
     }
 
+    /**
+     * @dev Pins the precision of the discount path.
+     *
+     * The adjustment is held in scaled units until the final division, so a sub-unit adjustment
+     * survives long enough for `discountBps` to apply to it. Dividing down to whole hundredths of a
+     * bip first — the obvious way to write this — would floor 1.9 to 1, then floor 90% of 1 to 0,
+     * and return `baseFee` unchanged.
+     */
+    function test_feeFor_discountKeepsSubUnitPrecision() public view {
+        DriftFee.Params memory p = _defaultParams();
+        p.feePerTick = 1;
+        p.discountBps = 9000;
+        p.minFee = 0;
+
+        // Reference a tenth of a tick above zero with the pool at tick 2: 1.9 ticks of drift, so a
+        // raw adjustment of 1.9 units, of which 90% is 1.71.
+        (uint24 fee,, bool movingAway) = hook.feeForParams(p, 1e5, 2, true);
+
+        assertFalse(movingAway);
+        assertEq(fee, p.baseFee - 1);
+    }
+
     function test_feeFor_respectsDiscountFactor() public {
         DriftFee.Params memory p = _defaultParams();
         p.discountBps = 5000; // credit only half the adjustment back

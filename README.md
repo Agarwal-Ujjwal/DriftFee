@@ -109,6 +109,46 @@ FORK_BLOCK=25956318 forge test --match-path 'test/*.fork.t.sol'   # pin for repr
 CI runs the fork suite as a separate, non-blocking job, so a third-party RPC outage cannot redden a
 PR that broke nothing.
 
+### Static analysis
+
+```sh
+python3 -m venv .venv-slither && .venv-slither/bin/pip install slither-analyzer
+.venv-slither/bin/slither .
+```
+
+Slither reads `slither.config.json`; Mythril reads `myth-solc.json`, which carries this project's
+remappings, optimizer settings and `evmVersion`, since Mythril does not read `foundry.toml`.
+
+Both analyzers the pre-deploy checklist calls for are clean. Slither reports **0 findings**;
+Mythril reports no issues:
+
+```sh
+ln -sf "$HOME/Library/Application Support/svm/0.8.26/solc-0.8.26" .venv-slither/bin/solc
+PATH="$PWD/.venv-slither/bin:$PATH" myth analyze src/DriftFee.sol:DriftFee \
+  --solc-json myth-solc.json --execution-timeout 240
+```
+
+Treat the Mythril result as weak evidence rather than a clean bill of health: every hook entry point
+is `onlyPoolManager`, so symbolic execution from an arbitrary sender bounces off the access-control
+guard before it reaches the fee math. The fuzz and invariant suites cover that math far better.
+Mythril also needs its own virtualenv in practice — it and Slither pin mutually incompatible `eth-*`
+versions (see `FEEDBACK.md`).
+
+On the Slither side: `slither.config.json` filters `lib/` and `test/` and excludes two
+detectors, which is worth being explicit about, since an excluded detector hides future findings too:
+
+| Excluded              | Why                                                                                                                                                                                                |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timestamp`           | Time decay *is* the mechanism here. The skew a validator can introduce is a few seconds against a window of at least 1800, and skew cannot add samples, since at most one is taken per timestamp.     |
+| `incorrect-equality`  | The flagged comparisons are `driftScaled == 0` (exactly at equilibrium), `elapsed == 0` (nothing to fold), and a boolean equality. None involve a balance or a rounding boundary.                     |
+
+`unused-return` is deliberately **left enabled** — unchecked return values are a real bug class — so
+its two imprecise hits (destructuring `slot0` for the tick alone) are suppressed inline instead.
+
+One earlier finding was real and is fixed: the discount path divided down to whole hundredths of a bip
+before applying `discountBps`, discarding up to a full unit. The adjustment now stays scaled until the
+final division. `test_feeFor_discountKeepsSubUnitPrecision` pins it.
+
 ## Status
 
 Unaudited and undeployed. There is no deployment script yet: deploying a v4 hook requires mining a
