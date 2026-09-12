@@ -98,13 +98,16 @@ contract DriftFeeInvariantsTest is Test, Deployers {
     function invariant_quotedFeeStaysWithinBand() public view {
         DriftFee.Params memory p = _params();
 
-        int24[5] memory deltas = [int24(-8_000_000), -100, 0, 100, 8_000_000];
+        int24[5] memory points = [int24(-800_000), -100, 0, 100, 800_000];
 
-        for (uint256 i; i < deltas.length; ++i) {
-            uint24 fee = hook.quoteFeeForDriftDelta(key, deltas[i]);
+        // Every pairing, so crossing paths are covered as well as monotone ones.
+        for (uint256 i; i < points.length; ++i) {
+            for (uint256 j; j < points.length; ++j) {
+                uint24 fee = hook.quoteFeeForPath(key, points[i], points[j]);
 
-            assertGe(fee, p.minFee, "fee below floor");
-            assertLe(fee, p.maxFee, "fee above ceiling");
+                assertGe(fee, p.minFee, "fee below floor");
+                assertLe(fee, p.maxFee, "fee above ceiling");
+            }
         }
     }
 
@@ -127,8 +130,8 @@ contract DriftFeeInvariantsTest is Test, Deployers {
         int24[3] memory magnitudes = [int24(1), 100, 10_000];
 
         for (uint256 i; i < magnitudes.length; ++i) {
-            uint24 widen = hook.quoteFeeForDriftDelta(key, magnitudes[i]);
-            uint24 narrow = hook.quoteFeeForDriftDelta(key, -magnitudes[i]);
+            uint24 widen = hook.quoteFeeForPath(key, 0, magnitudes[i]);
+            uint24 narrow = hook.quoteFeeForPath(key, magnitudes[i], 0);
 
             assertGe(widen, narrow, "creating drift was cheaper than repairing it");
         }

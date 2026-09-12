@@ -323,3 +323,25 @@ arrives with no indication of which variables are at fault, and the natural firs
 enabling `via_ir` — is a heavier change than the situation warrants. Hooks are unusually prone to
 this because the callback signatures are fixed and wide; a note in the hook docs suggesting a
 split-by-default structure would land better than the compiler's suggestion.
+
+### 20. Nothing in the hook tooling prompts you to test a fee rule against trade splitting
+
+Two fee rules shipped here with full unit, fuzz, invariant and fork coverage, and both were defeated
+by the same trivially available manoeuvre: cut the trade into N pieces. The second rule went from
+"passes 74 tests including 10,000-run fuzzing" to "within 3.4bps of having no hook at all" under a
+40-way split.
+
+No tooling suggests this. `forge test` has no notion of it, none of the example hooks demonstrate it,
+and the v4 hook documentation discusses dynamic fees purely in terms of what a single swap should be
+charged. Yet **split-invariance is close to a correctness requirement for any hook that charges a
+rate on notional derived from pool state**: if `fee(V) != sum(fee(V/N))`, the larger of the two is
+advisory only, because execution algos already slice by default.
+
+The underlying rule is simple enough to state: a fee that is a function of the *endpoints* of a
+swap's price path, charged as a rate on notional, is split-exploitable. It has to be an integral over
+the path. That is not obvious from anything in the docs, and the failure is silent — the mechanism
+keeps working, just not for anyone who slices.
+
+Two cheap things would help every hook author: a worked splitting attack in the dynamic-fee hook
+examples, and a note in the docs that a fee derived from a price *delta* needs a split-invariance
+argument. A reusable `assertSplitInvariant(pool, notional, slices)` test helper would be better still.

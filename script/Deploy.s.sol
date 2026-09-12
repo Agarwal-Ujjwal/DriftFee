@@ -43,10 +43,12 @@ contract Deploy is Script {
     error UnsupportedChain(uint256 chainId);
     error NoPoolManagerCode(address poolManager);
     error AddressMismatch(address expected, address actual);
+    error OwnerMustBeSet();
+    error OwnerIsNotAContract(address owner);
 
     function run() external returns (DriftFee hook) {
         address poolManager = _poolManager();
-        address owner = vm.envOr("OWNER", msg.sender);
+        address owner = _owner();
         DriftFee.Params memory params = _params();
 
         if (poolManager.code.length == 0) revert NoPoolManagerCode(poolManager);
@@ -68,6 +70,25 @@ contract Deploy is Script {
         // Belt and braces: the constructor already rejects a wrong address, but a mismatch here
         // would mean the mined salt and the broadcast deployer disagreed, which is worth naming.
         if (address(hook) != predicted) revert AddressMismatch(predicted, address(hook));
+    }
+
+    /**
+     * @dev The account that will own the hook.
+     *
+     * `OWNER` is required rather than defaulting to the broadcaster. The owner can retune the curve
+     * on every pool using this hook, immediately and without a timelock, and pools can never migrate
+     * away because the hook address is part of `PoolKey` — so which account holds that power is not
+     * a detail to settle implicitly from whichever key happened to sign the deployment.
+     *
+     * It should be a multisig behind a timelock. That cannot be checked from here, but an owner with
+     * no code definitely is not one, so deploying to a bare EOA has to be stated outright via
+     * `ALLOW_EOA_OWNER=true` instead of happening by omission.
+     */
+    function _owner() internal view virtual returns (address owner) {
+        owner = vm.envOr("OWNER", address(0));
+        if (owner == address(0)) revert OwnerMustBeSet();
+
+        if (owner.code.length == 0 && !vm.envOr("ALLOW_EOA_OWNER", false)) revert OwnerIsNotAContract(owner);
     }
 
     /**

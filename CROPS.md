@@ -16,12 +16,17 @@ if the mitigation fails.
 >   valid curve, giving a flat 10% fee in both directions with the drift mechanism disabled.
 >   `baseFee` (and so `minFee`) is now independently capped by `MAX_BASE_FEE` (1%), and
 >   `MAX_CONFIGURABLE_FEE` dropped to 3%. See `test_setParams_cannotFlattenPoolToASingleExtractiveRate`.
-> - **The `OWNER` default is still an EOA**, as reported. Documented in `README.md` as something to
->   change before any real deployment; not yet enforced in `script/Deploy.s.sol`.
+> - **The `OWNER` default is gone.** `script/Deploy.s.sol` now requires `OWNER` explicitly
+>   (`OwnerMustBeSet`) and rejects an owner with no code unless `ALLOW_EOA_OWNER=true` is set
+>   outright (`OwnerIsNotAContract`), so deploying under a bare EOA is a stated choice rather than
+>   the default. A multisig-behind-timelock still cannot be enforced onchain; that remains an
+>   operational requirement, documented in `README.md`.
 >
-> Separately, the fee rule itself was replaced after an adversarial review: fees now price the drift
-> a swap *creates* rather than the drift it starts from, which added `afterSwap` and
-> `afterSwapReturnDelta` to the hook's permissions and changed its deployed address. The Security and
+> Separately, the fee rule itself has been replaced **twice** since this audit. It now prices the
+> average distance from equilibrium over a swap's whole price path, after the second rule (drift
+> created, measured endpoint-to-endpoint) was defeated by trade splitting. The hook gained
+> `afterSwap` and `afterSwapReturnDelta` permissions along the way, which changed its deployed
+> address. The Security and
 > Censorship-resistance pillars below should be re-read with that in mind — in particular, the hook
 > now takes a fee delta and calls `donate`, where previously it made no state-changing external
 > calls at all. **This warrants a fresh audit rather than an amended one.**

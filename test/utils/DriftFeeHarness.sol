@@ -24,15 +24,15 @@ contract DriftFeeHarness is DriftFee {
         return _fold(referenceScaled, currentTick, elapsed, window);
     }
 
-    /// @dev Prices an explicit curve against an explicit drift change, so the fee rule can be
-    /// fuzzed over its whole domain without a storage write per run.
-    function feeForParams(Params memory p, int256 driftDeltaScaled) external pure returns (uint24) {
-        return _feeForDriftDelta(p, driftDeltaScaled);
+    /// @dev Prices an explicit curve against an explicit drift path, so the fee rule can be fuzzed
+    /// over its whole domain without a storage write per run.
+    function feeForParams(Params memory p, int256 beforeScaled, int256 afterScaled) external pure returns (uint24) {
+        return _feeForPath(p, beforeScaled, afterScaled);
     }
 
     /// @dev Prices against the curve a pool would actually use.
-    function feeFor(PoolKey calldata key, int256 driftDeltaScaled) external view returns (uint24) {
-        return _feeForDriftDelta(_effectiveParams(key.toId()), driftDeltaScaled);
+    function feeFor(PoolKey calldata key, int256 beforeScaled, int256 afterScaled) external view returns (uint24) {
+        return _feeForPath(_effectiveParams(key.toId()), beforeScaled, afterScaled);
     }
 
     // Exclude from the coverage report.

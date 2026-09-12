@@ -26,6 +26,10 @@ contract DeployHarness is Deploy {
         return _defaultPoolManager();
     }
 
+    function owner() external view returns (address) {
+        return _owner();
+    }
+
     function params() external view returns (DriftFee.Params memory) {
         return _params();
     }
@@ -86,8 +90,8 @@ contract DeployScriptTest is Test, Deployers {
         // contract exists for, running on a mined address.
         swap(poolKey, true, -1e16, ZERO_BYTES);
 
-        assertGt(hook.quoteFeeForDriftDelta(poolKey, 100), params.baseFee, "widening drift is not surcharged");
-        assertLt(hook.quoteFeeForDriftDelta(poolKey, -100), params.baseFee, "narrowing drift is not discounted");
+        assertGt(hook.quoteFeeForPath(poolKey, 0, 200), params.baseFee, "widening drift is not surcharged");
+        assertLt(hook.quoteFeeForPath(poolKey, 200, 0), params.baseFee, "narrowing drift is not discounted");
     }
 
     function test_defaultParamsMatchTheDocumentedCurve() public view {
@@ -121,6 +125,37 @@ contract DeployScriptTest is Test, Deployers {
 
         vm.chainId(42161);
         assertEq(harness.defaultPoolManager(), 0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32, "arbitrum");
+    }
+
+    /**
+     * @dev Ownership must be chosen deliberately, not inherited from whoever signed the deploy.
+     *
+     * All three cases live in one test on purpose: `vm.setEnv` writes to the process environment,
+     * which every test in the run shares, so splitting these across tests would let them race.
+     */
+    function test_owner_mustBeSetAndShouldBeAContract() public {
+        // Unset: refuse rather than defaulting to the broadcaster.
+        vm.setEnv("OWNER", vm.toString(address(0)));
+        vm.expectRevert(Deploy.OwnerMustBeSet.selector);
+        harness.owner();
+
+        // A bare EOA is refused unless the deployer says so outright.
+        address eoa = makeAddr("someEOA");
+        vm.setEnv("OWNER", vm.toString(eoa));
+        vm.setEnv("ALLOW_EOA_OWNER", "false");
+        vm.expectRevert(abi.encodeWithSelector(Deploy.OwnerIsNotAContract.selector, eoa));
+        harness.owner();
+
+        // ...and accepted when it is.
+        vm.setEnv("ALLOW_EOA_OWNER", "true");
+        assertEq(harness.owner(), eoa, "explicit EOA opt-in was ignored");
+
+        // A contract owner — a multisig or timelock in practice — needs no opt-in.
+        vm.setEnv("ALLOW_EOA_OWNER", "false");
+        vm.setEnv("OWNER", vm.toString(address(harness)));
+        assertEq(harness.owner(), address(harness), "contract owner was rejected");
+
+        vm.setEnv("OWNER", vm.toString(address(0)));
     }
 
     /// @dev An unknown chain must not silently fall back to some other chain's manager.

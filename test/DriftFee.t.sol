@@ -290,7 +290,7 @@ contract DriftFeeTest is Test, Deployers {
         // The pool charges its own curve, not the default. The pool's own fee path carries the
         // override's floor; the drift-dependent remainder is charged in `afterSwap`.
         assertEq(_swapAndReadPoolFee(true, 1e15), tight.minFee);
-        assertLt(hook.feeFor(key, -100 * 1e6), _defaultParams().baseFee);
+        assertLt(hook.feeFor(key, 100 * 1e6, 0), _defaultParams().baseFee);
     }
 
     function test_clearPoolParams_revertsToDefault() public {
@@ -378,34 +378,35 @@ contract DriftFeeTest is Test, Deployers {
 
     /// @dev A swap that leaves the distance from equilibrium unchanged is neutral.
     function test_feeFor_neutralSwapPaysBaseFee() public view {
-        assertEq(hook.feeFor(key, 0), _defaultParams().baseFee);
+        assertEq(hook.feeFor(key, 0, 0), _defaultParams().baseFee);
     }
 
     function test_feeFor_wideningIsSurcharged() public view {
         DriftFee.Params memory p = _defaultParams();
 
-        assertEq(hook.feeFor(key, 50 * 1e6), p.baseFee + 50 * p.feePerTick);
+        // Path 0 -> 50 averages 25 ticks of drift, so the surcharge is on 25, not 50.
+        assertEq(hook.feeFor(key, 0, 50 * 1e6), p.baseFee + 25 * p.feePerTick);
     }
 
     function test_feeFor_narrowingIsDiscounted() public view {
         DriftFee.Params memory p = _defaultParams();
 
-        assertEq(hook.feeFor(key, -50 * 1e6), p.baseFee - 50 * p.feePerTick);
+        assertEq(hook.feeFor(key, 50 * 1e6, 0), p.baseFee - 25 * p.feePerTick);
     }
 
     /// @dev The fee depends only on how much the gap changed, not on which side of equilibrium the
     /// pool happens to sit. Widening by 50 costs the same whether the pool is above or below.
     function test_feeFor_dependsOnMagnitudeNotSide() public view {
-        assertEq(hook.feeFor(key, 50 * 1e6), hook.feeFor(key, 50 * 1e6));
-        assertGt(hook.feeFor(key, 50 * 1e6), hook.feeFor(key, -50 * 1e6));
+        assertEq(hook.feeFor(key, 0, 50 * 1e6), hook.feeFor(key, 0, -50 * 1e6), "side should not matter");
+        assertGt(hook.feeFor(key, 0, 50 * 1e6), hook.feeFor(key, 50 * 1e6, 0), "creating must cost more");
     }
 
     function test_feeFor_clampsAtMaxFee() public view {
-        assertEq(hook.feeFor(key, 2000 * 1e6), _defaultParams().maxFee);
+        assertEq(hook.feeFor(key, 0, 2000 * 1e6), _defaultParams().maxFee);
     }
 
     function test_feeFor_clampsAtMinFee() public view {
-        assertEq(hook.feeFor(key, -2000 * 1e6), _defaultParams().minFee);
+        assertEq(hook.feeFor(key, 2000 * 1e6, 0), _defaultParams().minFee);
     }
 
     /// @dev Half a tick of change still moves the fee: the adjustment is computed on the scaled
@@ -413,7 +414,8 @@ contract DriftFeeTest is Test, Deployers {
     function test_feeFor_subTickChangeIsPriced() public view {
         DriftFee.Params memory p = _defaultParams();
 
-        assertEq(hook.feeFor(key, 5e5), p.baseFee + p.feePerTick / 2);
+        // Path 0 -> 1 tick averages half a tick.
+        assertEq(hook.feeFor(key, 0, 1e6), p.baseFee + p.feePerTick / 2);
     }
 
     /**
@@ -430,14 +432,14 @@ contract DriftFeeTest is Test, Deployers {
         p.minFee = 0;
 
         // 1.9 ticks of narrowing: a raw adjustment of 1.9 units, of which 90% is 1.71.
-        assertEq(hook.feeForParams(p, -19e5), p.baseFee - 1);
+        assertEq(hook.feeForParams(p, 38e5, 0), p.baseFee - 1);
     }
 
     function test_feeFor_respectsDiscountFactor() public view {
         DriftFee.Params memory p = _defaultParams();
         p.discountBps = 5000; // credit only half the adjustment back
 
-        assertEq(hook.feeForParams(p, -50 * 1e6), p.baseFee - (50 * p.feePerTick) / 2);
+        assertEq(hook.feeForParams(p, 50 * 1e6, 0), p.baseFee - (25 * p.feePerTick) / 2);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -654,12 +656,83 @@ contract DriftFeeTest is Test, Deployers {
         (int24 referenceBefore, uint40 lastUpdateBefore,) = hook.driftState(key);
 
         hook.currentDrift(key);
-        hook.quoteFeeForDriftDelta(key, 100);
+        hook.quoteFeeForPath(key, 0, 100);
 
         (int24 referenceAfter, uint40 lastUpdateAfter,) = hook.driftState(key);
 
         assertEq(referenceAfter, referenceBefore);
         assertEq(lastUpdateAfter, lastUpdateBefore);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                     REGRESSION: SPLITTING AND CROSSING
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Slicing a trade must not defeat the surcharge.
+     *
+     * The rule this replaced charged on `|drift after| - |drift before|`, which is linear in the
+     * marginal drift while the fee is a rate on notional — so N slices each created `D/N` of drift
+     * on `V/N` of notional and the drift term collapsed as `k·D·V/N`. A 40-way split landed within
+     * 3.4bps of a pool with no hook at all. Averaging over the path telescopes instead.
+     *
+     * A small residual remains: the trapezoid assumes drift moves linearly in volume within a slice,
+     * and on a constant-product curve it does not, so finer slicing tracks the true integral
+     * slightly better. It is bounded at a few bps rather than being the whole mechanism.
+     */
+    function test_splittingDoesNotDefeatTheSurcharge() public {
+        PoolKey memory poolKey = _freshPool(IHooks(address(hook)), LPFeeLibrary.DYNAMIC_FEE_FLAG, 30);
+
+        uint256 total = 2e16;
+        uint256 snapshot = vm.snapshotState();
+
+        uint256 one = _sellInSlices(poolKey, 1, total);
+        vm.revertToState(snapshot);
+        uint256 forty = _sellInSlices(poolKey, 40, total);
+
+        assertGt(forty, one, "expected some residual gain from slicing");
+
+        uint256 gainBps = (forty - one) * 10_000 / one;
+        emit log_named_uint("40-slice gain, bps", gainBps);
+
+        assertLt(gainBps, 25, "slicing recovered too much of the surcharge");
+    }
+
+    /// @dev A round trip must cost more here than on a static-fee pool of the same base rate. The
+    /// previous rule made it ~39% cheaper, which subsidised the manipulation flow this hook exists
+    /// to price up.
+    function test_roundTripCostsMoreThanOnAStaticPool() public {
+        PoolKey memory hookKey = _freshPool(IHooks(address(hook)), LPFeeLibrary.DYNAMIC_FEE_FLAG, 30);
+        PoolKey memory staticKey = _freshPool(IHooks(address(0)), 3000, 60);
+
+        uint256 snapshot = vm.snapshotState();
+        uint256 sliced = _roundTripCost(hookKey, 60, 2e16);
+        vm.revertToState(snapshot);
+        uint256 control = _roundTripCost(staticKey, 1, 2e16);
+
+        assertGt(sliced, control, "round trip is cheaper here than with no hook at all");
+    }
+
+    /**
+     * @dev A swap crossing equilibrium creates drift on the far side, and must be charged for it.
+     *
+     * The endpoint rule saw only the net change, so a swap from `+50` to `-800` read as a `750`-tick
+     * *repair* and was discounted, despite creating 800 ticks of fresh drift. Splitting the path at
+     * the crossing prices each half in its own direction.
+     */
+    function test_crossingEquilibriumIsPricedOnBothHalves() public view {
+        DriftFee.Params memory p = _defaultParams();
+
+        // Creates far more than it repairs.
+        assertGt(hook.quoteFeeForPath(key, 50, -800), p.baseFee, "far-side drift was not surcharged");
+
+        // Repairs far more than it creates.
+        assertLt(hook.quoteFeeForPath(key, 800, -50), p.baseFee, "a genuine repair was not discounted");
+
+        // Near-symmetric: the two halves roughly cancel, which is the correct neutral answer.
+        assertApproxEqAbs(
+            uint256(hook.quoteFeeForPath(key, 395, -392)), uint256(p.baseFee), 100, "symmetric swing was not neutral"
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -720,7 +793,8 @@ contract DriftFeeTest is Test, Deployers {
     /// @dev The applied fee stays inside the configured band for every drift change and any valid
     /// parameter set. The fee never goes negative, so the hook never pays a rebate.
     function testFuzz_feeAlwaysWithinConfiguredBand(
-        int256 driftDeltaScaled,
+        int256 beforeScaled,
+        int256 afterScaled,
         uint24 baseFee,
         uint24 minFee,
         uint24 maxFee,
@@ -730,9 +804,10 @@ contract DriftFeeTest is Test, Deployers {
     ) public view {
         DriftFee.Params memory p = _boundedParams(baseFee, minFee, maxFee, feePerTick, maxAdjustment, discountBps, 1800);
 
-        driftDeltaScaled = bound(driftDeltaScaled, -1_800_000 * 1e6, 1_800_000 * 1e6);
+        beforeScaled = bound(beforeScaled, -900_000 * 1e6, 900_000 * 1e6);
+        afterScaled = bound(afterScaled, -900_000 * 1e6, 900_000 * 1e6);
 
-        uint24 fee = hook.feeForParams(p, driftDeltaScaled);
+        uint24 fee = hook.feeForParams(p, beforeScaled, afterScaled);
 
         assertGe(fee, p.minFee, "fee below floor");
         assertLe(fee, p.maxFee, "fee above ceiling");
@@ -765,8 +840,8 @@ contract DriftFeeTest is Test, Deployers {
         magnitudeScaled = bound(magnitudeScaled, 0, 1_800_000 * 1e6);
 
         assertGe(
-            hook.feeForParams(p, magnitudeScaled),
-            hook.feeForParams(p, -magnitudeScaled),
+            hook.feeForParams(p, 0, magnitudeScaled),
+            hook.feeForParams(p, magnitudeScaled, 0),
             "creating drift was cheaper than repairing it"
         );
     }
@@ -777,8 +852,8 @@ contract DriftFeeTest is Test, Deployers {
         int256 small = int256(bound(smallSeed, 0, 100_000 * 1e6));
         int256 large = small + int256(bound(extraSeed, 0, 100_000 * 1e6));
 
-        assertGe(hook.feeFor(key, large), hook.feeFor(key, small), "surcharge fell as drift grew");
-        assertLe(hook.feeFor(key, -large), hook.feeFor(key, -small), "discount shrank as repair grew");
+        assertGe(hook.feeFor(key, 0, large), hook.feeFor(key, 0, small), "surcharge fell as drift grew");
+        assertLe(hook.feeFor(key, large, 0), hook.feeFor(key, small, 0), "discount shrank as repair grew");
     }
 
     /// @dev The discount never becomes a rebate: the credit never exceeds the headroom above
@@ -789,7 +864,7 @@ contract DriftFeeTest is Test, Deployers {
 
         magnitudeScaled = bound(magnitudeScaled, 0, 1_800_000 * 1e6);
 
-        uint24 narrowFee = hook.feeForParams(p, -magnitudeScaled);
+        uint24 narrowFee = hook.feeForParams(p, magnitudeScaled, 0);
 
         assertGe(narrowFee, p.minFee, "the discount breached the floor");
         assertLe(narrowFee, p.baseFee, "narrowing cost more than the base rate");
@@ -884,6 +959,43 @@ contract DriftFeeTest is Test, Deployers {
         p.maxAdjustment = uint24(bound(maxAdjustment, 0, cap));
         p.discountBps = uint16(bound(discountBps, 0, 10_000));
         p.referenceWindow = uint32(bound(referenceWindow, hook.MIN_REFERENCE_WINDOW(), hook.MAX_REFERENCE_WINDOW()));
+    }
+
+    /// @dev A pool deep enough to trade against but shallow enough that a test-sized swap actually
+    /// moves the price, which is the regime where the drift mechanism does anything at all.
+    function _freshPool(IHooks hooks, uint24 fee, int24 tickSpacing) private returns (PoolKey memory poolKey) {
+        (poolKey,) = initPool(currency0, currency1, hooks, fee, tickSpacing, SQRT_PRICE_1_1);
+
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({tickLower: -30000, tickUpper: 30000, liquidityDelta: 1e18, salt: 0}),
+            ZERO_BYTES
+        );
+    }
+
+    function _sellInSlices(PoolKey memory poolKey, uint256 slices, uint256 total) private returns (uint256 received) {
+        uint256 before = MockERC20(Currency.unwrap(currency1)).balanceOf(address(this));
+
+        for (uint256 i; i < slices; ++i) {
+            swap(poolKey, true, -int256(total / slices), ZERO_BYTES);
+        }
+
+        return MockERC20(Currency.unwrap(currency1)).balanceOf(address(this)) - before;
+    }
+
+    /// @dev Cost, in token0, of pushing `push` out and bringing all of it back.
+    function _roundTripCost(PoolKey memory poolKey, uint256 slices, uint256 push) private returns (uint256) {
+        uint256 start = MockERC20(Currency.unwrap(currency0)).balanceOf(address(this));
+
+        uint256 received;
+        for (uint256 i; i < slices; ++i) {
+            uint256 before = MockERC20(Currency.unwrap(currency1)).balanceOf(address(this));
+            swap(poolKey, true, -int256(push / slices), ZERO_BYTES);
+            received += MockERC20(Currency.unwrap(currency1)).balanceOf(address(this)) - before;
+        }
+        swap(poolKey, false, -int256(received), ZERO_BYTES);
+
+        return start - MockERC20(Currency.unwrap(currency0)).balanceOf(address(this));
     }
 
     function _hookBalance(Currency currency) private view returns (uint256) {

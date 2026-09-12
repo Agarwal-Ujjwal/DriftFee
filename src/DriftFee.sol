@@ -41,29 +41,46 @@ import {CurrencySettler} from "uniswap-hooks/utils/CurrencySettler.sol";
  *   remaining gap, so no single sample can replace the reference. Moving equilibrium requires
  *   holding a price across many separate timestamps against arbitrage, not one transaction.
  *
- * ## How the fee is charged, and why in two parts
+ * ## How the fee is charged
  *
- * The fee is a function of the drift a swap **creates**: `|drift after| - |drift before|`. Widening
- * that gap is surcharged, narrowing it is discounted.
+ * The fee is a function of the **path** a swap traces relative to equilibrium: the average distance
+ * from equilibrium over the swap, priced as a surcharge where that distance grows and a discount
+ * where it shrinks. A swap that crosses equilibrium is split at the crossing and each half priced in
+ * its own direction.
  *
- * That quantity is not knowable in `beforeSwap`, so charging happens in two steps. `beforeSwap`
+ * That path is not knowable in `beforeSwap`, so charging happens in two steps. `beforeSwap`
  * overrides the pool's fee with {Params-minFee}, the floor everyone pays, which flows to liquidity
- * providers through the pool's own accounting. `afterSwap` then measures the drift actually created,
- * prices it, and takes the remainder from the swap's unspecified currency, donating it immediately
- * to the in-range liquidity providers. This contract never ends a call holding a balance, so the
- * owner never becomes the beneficiary of the fee it sets.
+ * providers through the pool's own accounting. `afterSwap` then measures where the swap actually
+ * landed, prices the path, and takes the remainder from the swap's unspecified currency, donating it
+ * immediately to the in-range liquidity providers. This contract never ends a call holding a
+ * balance, so the owner never becomes the beneficiary of the fee it sets.
  *
- * An earlier version priced on the drift a swap *started from*. That was unsound, and the reason is
- * worth keeping: a swap beginning at equilibrium took the zero-drift branch and paid the base rate
- * however far it moved the price, so the trade that caused the damage paid nothing for it while the
- * trade that repaired it was discounted. Because the two legs of a trade need not be the same size,
- * a trader could pay the base rate on a small pre-move and run a much larger main leg back at the
- * floor -- measured at 20bps of free improvement before the fix, and a loss after it. Round trips
- * were also cheaper here than on a static-fee pool, which subsidised exactly the manipulation flow
- * this hook exists to price up. See `test_premovingNoLongerBuysTheDiscount`.
+ * ## Two rules this replaced, and why both failed
  *
- * NOTE: the floor is charged on the swap and the remainder on its output, so the two compound
- * rather than summing exactly. The difference is second-order at these rates.
+ * Both earlier attempts priced on the **endpoints** of the drift path rather than integrating over
+ * it, and both were broken by adversarial review:
+ *
+ * 1. Pricing on the drift a swap *started from* meant a swap beginning at equilibrium paid the base
+ *    rate however far it moved the price. Since the legs of a trade need not be the same size, a
+ *    trader could pay base on a small pre-move and run a much larger main leg back at the floor.
+ * 2. Pricing on `|drift after| - |drift before|` is linear in the marginal drift while the fee is a
+ *    rate on notional, so slicing a trade N ways collapsed the drift term as `k·D·V/N`. A 40-way
+ *    split came within 3.4bps of a pool with no hook at all.
+ *
+ * Averaging over the path fixes both, and the fix is arithmetic rather than a tuning choice: slicing
+ * telescopes to the same total, and the far endpoint is always counted. See
+ * `test_splittingDoesNotDefeatTheSurcharge` and `test_premovingNoLongerBuysTheDiscount`.
+ *
+ * NOTE: a residual remains. The trapezoid assumes drift moves linearly in volume within a slice, and
+ * on a constant-product curve it does not, so very fine slicing tracks the true integral slightly
+ * better -- measured at ~10bps on a 40-way split, against 67bps under the rule this replaced.
+ *
+ * NOTE: the floor is charged on the swap and the remainder on its output, so the two compound rather
+ * than summing exactly. The difference is second-order at these rates.
+ *
+ * WARNING: the drift surcharge is donated to whoever is in range when the swap ends, not to the
+ * liquidity that filled it, so just-in-time liquidity can capture a disproportionate share of it.
+ * Addressing that needs liquidity-side hooks, which this contract does not implement.
  *
  * ## Trust surface
  *
@@ -94,6 +111,10 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
     using CurrencySettler for Currency;
 
     /// @dev keccak256(abi.encode(uint256(keccak256("driftfee.storage.pendingDrift")) - 1)) & ~bytes32(uint256(0xff))
+    /// @dev Derived per pool rather than kept in one global slot. Today `PoolManager.swap` runs
+    /// `beforeSwap -> _swap -> afterSwap` with no external call in between, so a single slot could
+    /// not be mispaired — but that is an invariant of v4-core's internals, not of anything this hook
+    /// enforces, and keying by pool costs nothing.
     bytes32 private constant PENDING_DRIFT_SLOT = 0x9a1f9d26b6a2ec78f0c2c40e1ba4b8dcec2ec0e97eeb8fdd25e0a5d1bd3f3300;
 
     /// @dev Fixed-point scale for the stored reference tick, so sub-tick drift is not truncated.
@@ -258,18 +279,16 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
     }
 
     /**
-     * @notice The fee a swap would pay for changing the pool's distance from equilibrium by
-     * `driftDeltaTicks`.
+     * @notice The fee a swap would pay for moving the pool from `driftBefore` to `driftAfter`, both
+     * signed distances from equilibrium in ticks.
      *
-     * @dev A pre-swap quote cannot be a function of direction alone any more, and that is the fix,
-     * not a regression: the fee depends on the drift a swap *creates*, which is not knowable until
-     * its size and the pool's liquidity are known. Callers that want a quote should estimate the
-     * post-swap tick themselves and pass `|drift after| - |drift before|` in ticks.
-     *
-     * Positive widens the gap and is surcharged; negative narrows it and is discounted.
+     * @dev The fee depends on the whole path a swap traces, so a quote needs both endpoints: its
+     * size and the pool's liquidity decide where it lands. Callers should estimate the post-swap
+     * tick themselves and pass the resulting drift.
      */
-    function quoteFeeForDriftDelta(PoolKey calldata key, int24 driftDeltaTicks) external view returns (uint24) {
-        return _feeForDriftDelta(_effectiveParams(key.toId()), int256(driftDeltaTicks) * TICK_SCALE);
+    function quoteFeeForPath(PoolKey calldata key, int24 driftBefore, int24 driftAfter) external view returns (uint24) {
+        return
+            _feeForPath(_effectiveParams(key.toId()), int256(driftBefore) * TICK_SCALE, int256(driftAfter) * TICK_SCALE);
     }
 
     /// @notice The pool's current distance from equilibrium, in ticks. Positive means the pool sits
@@ -356,10 +375,12 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         Params memory p = _effectiveParams(id);
         int256 referenceScaled = _updateReference(id, currentTick, p.referenceWindow);
 
-        // Carry the pre-swap distance from equilibrium into {_afterSwap}, which is the only place
-        // the drift this swap *creates* can be measured. Transient storage is correct here rather
-        // than merely cheap: the value is meaningless outside this one swap.
-        _setPendingDrift(_absDrift(referenceScaled, currentTick));
+        // Carry the pre-swap drift into {_afterSwap}, which is the only place the path this swap
+        // traces can be measured. Signed, because a swap that crosses equilibrium repairs drift on
+        // one side and creates it on the other, and those two halves are priced differently.
+        // Transient storage is correct here rather than merely cheap: the value is meaningless
+        // outside this one swap.
+        _setPendingDrift(id, _signedDrift(referenceScaled, currentTick));
 
         // Charge only the floor through the pool's own fee path. The drift-dependent remainder is
         // taken in {_afterSwap} once the swap's effect on the price is known.
@@ -399,26 +420,31 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
     function _priceDriftCreated(PoolKey calldata key) private returns (uint24 outstanding) {
         PoolId id = key.toId();
 
-        uint256 absBefore = _pendingDrift();
-        _setPendingDrift(0);
+        int256 driftBefore = _pendingDrift(id);
+        _setPendingDrift(id, 0);
 
         Params memory p = _effectiveParams(id);
 
         // slither-disable-next-line unused-return
         (, int24 tickAfter,,) = poolManager.getSlot0(id);
-        int256 driftDeltaScaled =
-            int256(_absDrift(int256(_driftStates[id].referenceTickScaled), tickAfter)) - int256(absBefore);
+        int256 driftAfter = _signedDrift(int256(_driftStates[id].referenceTickScaled), tickAfter);
 
-        uint24 totalFee = _feeForDriftDelta(p, driftDeltaScaled);
-
-        emit DriftFeeApplied(id, (driftDeltaScaled / TICK_SCALE).toInt24(), totalFee, driftDeltaScaled > 0);
+        uint24 totalFee = _feeForPath(p, driftBefore, driftAfter);
 
         // `minFee` was already charged by the pool's own fee path.
         outstanding = totalFee - p.minFee;
 
-        // Donating requires someone in range to receive it. With no in-range liquidity the swap
-        // could not have moved the price anyway, so waiving the remainder is the honest outcome.
-        if (poolManager.getLiquidity(id) == 0) outstanding = 0;
+        // Donating needs someone in range to receive it. A swap that consumed the outermost
+        // position leaves none, so the remainder is waived rather than accrued to this contract.
+        if (poolManager.getLiquidity(id) == 0) {
+            totalFee = p.minFee;
+            outstanding = 0;
+        }
+
+        // Emitted after the waiver, so the event reports what was charged rather than what was
+        // priced. Anything built on this event would otherwise be wrong in exactly the cases where
+        // those two diverge.
+        emit DriftFeeApplied(id, (driftAfter / TICK_SCALE).toInt24(), totalFee, _abs(driftAfter) > _abs(driftBefore));
     }
 
     /**
@@ -470,19 +496,21 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         permissions.afterSwapReturnDelta = true;
     }
 
-    /// @dev Absolute distance from equilibrium, scaled by {TICK_SCALE}.
-    function _absDrift(int256 referenceScaled, int24 tick) private pure returns (uint256) {
-        int256 driftScaled = int256(tick) * TICK_SCALE - referenceScaled;
-
-        return uint256(driftScaled < 0 ? -driftScaled : driftScaled);
+    /// @dev Signed distance from equilibrium, scaled by {TICK_SCALE}.
+    function _signedDrift(int256 referenceScaled, int24 tick) private pure returns (int256) {
+        return int256(tick) * TICK_SCALE - referenceScaled;
     }
 
-    function _pendingDrift() private view returns (uint256) {
-        return PENDING_DRIFT_SLOT.asUint256().tload();
+    function _abs(int256 value) private pure returns (uint256) {
+        return uint256(value < 0 ? -value : value);
     }
 
-    function _setPendingDrift(uint256 value) private {
-        PENDING_DRIFT_SLOT.asUint256().tstore(value);
+    function _pendingDrift(PoolId id) private view returns (int256) {
+        return PENDING_DRIFT_SLOT.deriveMapping(PoolId.unwrap(id)).asInt256().tload();
+    }
+
+    function _setPendingDrift(PoolId id, int256 value) private {
+        PENDING_DRIFT_SLOT.deriveMapping(PoolId.unwrap(id)).asInt256().tstore(value);
     }
 
     /// @dev The curve applied to `id`: its override if it has one, otherwise the default.
@@ -586,41 +614,97 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
     }
 
     /**
-     * @dev Price a swap from the change in absolute drift it caused.
+     * @dev Price a swap from the drift path it traced, as the average distance from equilibrium over
+     * the swap rather than any function of its endpoints alone.
      *
-     * @param driftDeltaScaled `|drift after| - |drift before|`, scaled by {TICK_SCALE}. Positive
-     * means the swap pushed the pool further from equilibrium; negative means it brought it back.
+     * ## Why an average and not a difference
      *
-     * @return fee The fee to charge, clamped to `[minFee, maxFee]`.
+     * Charging on `|drift after| - |drift before|` is defeated by splitting. That quantity is linear
+     * in the marginal drift while the fee is levied as a rate on notional, so cutting a trade into
+     * N slices leaves each slice creating `D/N` of drift on `V/N` of notional and the drift term
+     * collapses as `k·D·V/N`. Measured before this change: a 40-way split landed within 3.4bps of a
+     * pool with no hook at all.
+     *
+     * The average is a trapezoid rule over the same path, so slicing telescopes to the same total.
+     * For a move from `0` to `D` in N equal steps the drift term sums to `k·V·D/2` for every N,
+     * because `sum(2i-1) == N^2`. Split-invariance here is arithmetic, not a tuning choice.
+     *
+     * ## Crossing equilibrium
+     *
+     * A swap from `+d0` to `-d1` repairs `d0` of drift and then creates `d1` on the far side. Taking
+     * only the endpoints would call that a net repair and discount it, which is how a single swap
+     * could move the price hundreds of ticks and still be charged below the neutral rate. So the
+     * path is split at the crossing and each half priced in its own direction, weighted by the share
+     * of the tick distance it accounts for.
+     *
+     * @param driftBefore Signed distance from equilibrium before the swap, scaled by {TICK_SCALE}.
+     * @param driftAfter Signed distance after, same scale.
      */
-    function _feeForDriftDelta(Params memory p, int256 driftDeltaScaled) internal pure returns (uint24 fee) {
-        // A swap that left the distance from equilibrium unchanged is neutral: nothing to reward or
-        // penalise. This also covers a swap too small to move the tick at all.
-        if (driftDeltaScaled == 0) return p.baseFee;
+    function _feeForPath(Params memory p, int256 driftBefore, int256 driftAfter) internal pure returns (uint24 fee) {
+        uint256 absBefore = _abs(driftBefore);
+        uint256 absAfter = _abs(driftAfter);
 
-        bool widened = driftDeltaScaled > 0;
-        uint256 magnitudeScaled = uint256(widened ? driftDeltaScaled : -driftDeltaScaled);
+        // Crossing equilibrium, i.e. the path passes through zero with real distance on both sides.
+        if ((driftBefore > 0) != (driftAfter > 0) && absBefore != 0 && absAfter != 0) {
+            uint256 span = absBefore + absAfter;
 
-        // As in the reference fold, the adjustment stays scaled until the final division so that a
-        // sub-unit adjustment is not rounded away before `discountBps` applies to it.
+            // Each half is charged at its own average (half its own extent) over its share of the
+            // distance, `absBefore/span` and `absAfter/span`. The two `1/2`s and the two shares
+            // combine into `x^2 / (2 * span)`, which is why the squares appear here.
+            uint256 createdScaled = (absAfter * absAfter) / (2 * span);
+            uint256 repairedScaled = (absBefore * absBefore) / (2 * span);
+
+            return _applyAdjustments(p, createdScaled, repairedScaled);
+        }
+
+        // No crossing: the distance from equilibrium moves monotonically, so the whole swap is
+        // either creating drift or repairing it, averaged over the two endpoints.
+        uint256 averageScaled = (absBefore + absAfter) / 2;
+
+        return absAfter >= absBefore ? _applyAdjustments(p, averageScaled, 0) : _applyAdjustments(p, 0, averageScaled);
+    }
+
+    /**
+     * @dev Combine a surcharge for `createdScaled` of drift with a discount for `repairedScaled`,
+     * and clamp the result to the configured band.
+     *
+     * Both inputs are drift magnitudes scaled by {TICK_SCALE}, already averaged over the portion of
+     * the swap they apply to.
+     */
+    function _applyAdjustments(Params memory p, uint256 createdScaled, uint256 repairedScaled)
+        private
+        pure
+        returns (uint24)
+    {
+        // Both adjustments stay scaled until the final division, so a sub-unit adjustment is not
+        // rounded away before `discountBps` applies to it.
+        uint256 surcharge = _boundedAdjustment(p, createdScaled) / uint256(TICK_SCALE);
+        uint256 discount =
+            (_boundedAdjustment(p, repairedScaled) * p.discountBps) / (uint256(TICK_SCALE) * BPS_DENOMINATOR);
+
+        uint256 raised = uint256(p.baseFee) + surcharge;
+
+        // The discount is subtracted after the surcharge, so a crossing swap is charged the net of
+        // the two. `discountBps <= BPS_DENOMINATOR` keeps the credit for repairing a given distance
+        // no larger than the charge for creating it, which is what stops a two-leg round trip from
+        // being cheaper than not trading.
+        uint256 result = raised > discount ? raised - discount : 0;
+
+        if (result > p.maxFee) return p.maxFee;
+        if (result < p.minFee) return p.minFee;
+
+        // Casting to `uint24` is safe because `result` is bounded by `maxFee` immediately above.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint24(result);
+    }
+
+    /// @dev Adjustment for a drift magnitude, capped at `maxAdjustment`, and left scaled by
+    /// {TICK_SCALE} so the caller divides down only once, after any further scaling.
+    function _boundedAdjustment(Params memory p, uint256 magnitudeScaled) private pure returns (uint256) {
         uint256 adjustmentScaled = magnitudeScaled * p.feePerTick;
         uint256 maxAdjustmentScaled = uint256(p.maxAdjustment) * uint256(TICK_SCALE);
-        if (adjustmentScaled > maxAdjustmentScaled) adjustmentScaled = maxAdjustmentScaled;
 
-        if (widened) {
-            uint256 surcharged = uint256(p.baseFee) + adjustmentScaled / uint256(TICK_SCALE);
-            // Casting to `uint24` is safe because the branch is only taken when `surcharged` is at
-            // most `maxFee`, itself a `uint24`.
-            // forge-lint: disable-next-line(unsafe-typecast)
-            fee = surcharged > p.maxFee ? p.maxFee : uint24(surcharged);
-        } else {
-            uint256 discount = (adjustmentScaled * p.discountBps) / (uint256(TICK_SCALE) * BPS_DENOMINATOR);
-            uint256 headroom = uint256(p.baseFee) - p.minFee;
-            // Casting to `uint24` is safe because the branch is only taken when `discount` is below
-            // `headroom`, leaving a result strictly between `minFee` and `baseFee`.
-            // forge-lint: disable-next-line(unsafe-typecast)
-            fee = discount >= headroom ? p.minFee : uint24(uint256(p.baseFee) - discount);
-        }
+        return adjustmentScaled > maxAdjustmentScaled ? maxAdjustmentScaled : adjustmentScaled;
     }
 
     /**

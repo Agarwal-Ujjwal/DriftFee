@@ -27,40 +27,62 @@ So moving equilibrium requires *holding* a manipulated price across many separat
 arbitrage, not moving it for one transaction. `test_reference_samplesOnlyTheTopOfBlockTick` pins this
 down: a spike opened and unwound inside a block contributes nothing at all.
 
-## How the fee is charged, and why in two parts
+## How the fee is charged
 
-The fee is a function of the drift a swap **creates** — `|drift after| - |drift before|`. Widening
-that gap is surcharged; narrowing it is discounted.
+The fee is a function of the **path** a swap traces relative to equilibrium — the average distance
+from equilibrium over the swap — charged as a surcharge where that distance grows and a discount
+where it shrinks. A swap that crosses equilibrium is split at the crossing and each half priced in
+its own direction.
 
-That quantity isn't knowable in `beforeSwap`, so charging happens in two steps:
+That path isn't knowable in `beforeSwap`, so charging happens in two steps:
 
 1. **`beforeSwap`** overrides the pool's fee with `minFee`, the floor everyone pays, which reaches
    LPs through the pool's own accounting.
-2. **`afterSwap`** measures the drift actually created, prices it, takes the remainder from the
-   swap's unspecified currency, and **donates it immediately to the in-range LPs**. The hook never
-   ends a call holding a balance, so the owner never becomes the beneficiary of the fee it sets
-   (`test_fork_hookRetainsNoBalance` checks this against the real mainnet manager).
+2. **`afterSwap`** measures where the swap actually landed, prices the path, takes the remainder from
+   the swap's unspecified currency, and **donates it immediately to the in-range LPs**. The hook
+   never ends a call holding a balance, so the owner never becomes the beneficiary of the fee it
+   sets (`test_fork_hookRetainsNoBalance` checks this against the real mainnet manager).
 
-### The bug this replaced
+### Two rules this replaced
 
-The first version priced each swap on the drift it *started from*. An adversarial review broke it,
-and the reasoning is worth keeping:
+Both earlier designs priced on the **endpoints** of the drift path instead of integrating over it,
+and adversarial review broke both.
 
-A swap beginning at equilibrium took the zero-drift branch and paid `baseFee` **however far it moved
-the price**. So the trade that caused the damage paid nothing for it, while the trade that repaired
-it was discounted. Since the two legs of a trade need not be the same size, a trader could pay
-`baseFee` on a small pre-move and then run a much larger main leg back at `minFee` — **+20 bps of
-free improvement**, flash-loanable, in a single transaction. Round trips came out ~41% cheaper than
-on a static pool of the same base fee, which subsidised precisely the manipulation and sandwich flow
-the hook was meant to price up.
+**Attempt 1 — price on the drift a swap started from.** A swap beginning at equilibrium paid
+`baseFee` however far it moved the price, so the trade that caused the damage paid nothing while the
+trade that repaired it was discounted. Since the legs of a trade need not be the same size, paying
+`baseFee` on a small pre-move bought the floor rate on a much larger main leg: **+20 bps**,
+flash-loanable, one transaction.
 
-`test_premovingNoLongerBuysTheDiscount` replays that exact attack and asserts it now **loses** money
-(~16 bps worse than trading honestly, a ~36 bps swing), and `testFuzz_premovingIsNeverProfitable`
-sweeps pre-move sizes rather than trusting one. The invariant behind it —
-`testFuzz_wideningNeverCheaperThanNarrowing` — is that creating drift is never cheaper than repairing
-the same amount, for any curve.
+**Attempt 2 — price on `|drift after| − |drift before|`.** That quantity is linear in the marginal
+drift while the fee is a rate on notional, so slicing a trade N ways collapsed the drift term as
+`k·D·V/N`. A 40-way split came within **3.4 bps** of a pool with no hook at all — the mechanism
+simply switched off, for about $135 of gas.
 
-The hook still never pays a rebate: the fee is clamped to `[minFee, maxFee]` with `minFee >= 0`.
+**The fix is arithmetic, not tuning.** Averaging over the path is a trapezoid rule, so slicing
+telescopes to the same total: for a move `0 → D` in N equal steps the drift term sums to `k·V·D/2`
+for every N, because `Σ(2i−1) = N²`. And the far endpoint is always counted, so a pre-move pays for
+the drift it creates.
+
+Measured after the change:
+
+| attack | before | after |
+| --- | --- | --- |
+| 40-way split vs one swap | +67 bps | **+10 bps** |
+| round trip vs static pool | 39% cheaper | **39% dearer** |
+| pre-move vs honest | +20 bps | **−16 bps** |
+| crossing `+50 → −800` | discounted | **9956** (near `maxFee`) |
+
+### Known limitations
+
+- **A residual split advantage of ~10 bps remains.** The trapezoid assumes drift moves linearly in
+  volume within a slice; on a constant-product curve it doesn't, so very fine slicing tracks the true
+  integral slightly better. Bounded and small, rather than being the whole mechanism.
+- **JIT liquidity can capture the surcharge.** The remainder is donated to whoever is in range when
+  the swap *ends*, not to the liquidity that filled it. A JIT supplying ~8% of a fill was measured
+  taking ~91% of the drift surcharge. Fixing it needs liquidity-side hooks, which this hook does not
+  implement.
+- The hook still never pays a rebate: the fee is clamped to `[minFee, maxFee]` with `minFee >= 0`.
 
 ## The fee curve
 
@@ -203,9 +225,24 @@ forge script script/Deploy.s.sol:Deploy --rpc-url <url> --broadcast --verify
 
 The `PoolManager` defaults to the verified address for the chain being deployed to (Ethereum,
 Optimism, Base, Arbitrum); `POOL_MANAGER` overrides it, and an unrecognised chain reverts rather than
-falling back to a guess. `OWNER` defaults to the broadcasting account. Every curve parameter can be
-set by environment variable and is validated by the constructor, so a bad value fails before
-broadcast rather than leaving a live hook with a nonsense curve.
+falling back to a guess. Every curve parameter can be set by environment variable and is validated by
+the constructor, so a bad value fails before broadcast rather than leaving a live hook with a nonsense
+curve.
+
+**`OWNER` is required.** It is not inherited from whoever signs the deployment: the owner can retune
+the curve on every pool using this hook, immediately and without a timelock, and pools can never
+migrate away because the hook address is part of `PoolKey`. It should be a multisig behind a
+timelock. That can't be checked onchain, but an owner with no code definitely isn't one, so
+deploying to a bare EOA has to be stated outright:
+
+```sh
+OWNER=0x…             forge script script/Deploy.s.sol:Deploy --rpc-url <url>   # contract owner: fine
+OWNER=0x… ALLOW_EOA_OWNER=true  forge script …                                  # EOA: must opt in
+                      forge script …                                            # unset: OwnerMustBeSet()
+```
+
+Because `OWNER` is a constructor argument it feeds the creation-code hash, so changing it changes the
+mined address. Mine the salt for the owner you will actually deploy with.
 
 A mainnet dry run mines a salt in a couple of thousand iterations (most recently `0x920`, giving
 `0x727fC80D…90c4`, whose low 14 bits are `0x10c4` as required) and costs roughly 0.0004 ETH to
