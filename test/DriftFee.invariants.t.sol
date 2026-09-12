@@ -17,7 +17,10 @@ import {DriftFeeHarness} from "./utils/DriftFeeHarness.sol";
 import {DriftFeeHandler} from "./utils/DriftFeeHandler.sol";
 
 contract DriftFeeInvariantsTest is Test, Deployers {
-    uint160 private constant HOOK_FLAGS = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG);
+    uint160 private constant HOOK_FLAGS = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+    );
 
     DriftFeeHarness internal hook;
     DriftFeeHandler internal handler;
@@ -91,35 +94,43 @@ contract DriftFeeInvariantsTest is Test, Deployers {
         assertLe(int256(referenceTick), int256(handler.maxObservedTick()) + 1, "equilibrium above observed range");
     }
 
-    /// @dev Every quotable fee, in both directions, stays inside the configured band.
+    /// @dev Every quotable fee, for any drift change in either direction, stays inside the band.
     function invariant_quotedFeeStaysWithinBand() public view {
         DriftFee.Params memory p = _params();
 
-        uint24 feeUp = hook.quoteFee(key, false);
-        uint24 feeDown = hook.quoteFee(key, true);
+        int24[5] memory deltas = [int24(-8_000_000), -100, 0, 100, 8_000_000];
 
-        assertGe(feeUp, p.minFee);
-        assertLe(feeUp, p.maxFee);
-        assertGe(feeDown, p.minFee);
-        assertLe(feeDown, p.maxFee);
+        for (uint256 i; i < deltas.length; ++i) {
+            uint24 fee = hook.quoteFeeForDriftDelta(key, deltas[i]);
+
+            assertGe(fee, p.minFee, "fee below floor");
+            assertLe(fee, p.maxFee, "fee above ceiling");
+        }
     }
 
     /// @dev The reference is seeded once and never un-seeded, and its clock never runs ahead.
     function invariant_referenceClockIsSane() public view {
-        (, uint32 lastUpdate, bool initialized) = hook.driftState(key);
+        (, uint40 lastUpdate, bool initialized) = hook.driftState(key);
 
         assertTrue(initialized, "reference lost its seed");
         assertLe(uint256(lastUpdate), block.timestamp, "reference folded from the future");
     }
 
-    /// @dev At most one of the two directions can be surcharged at any given moment: the fee split
-    /// is genuinely directional rather than a blanket increase on both sides.
-    function invariant_atMostOneDirectionIsSurcharged() public view {
-        DriftFee.Params memory p = _params();
+    /**
+     * @dev Widening drift is never cheaper than narrowing it by the same amount.
+     *
+     * This is the property the redesign exists to guarantee. Under the old rule, which priced off
+     * the drift a swap started from, a swap leaving equilibrium paid the base rate however far it
+     * moved the price, so creating drift could be cheaper than repairing it.
+     */
+    function invariant_wideningIsNeverCheaperThanNarrowing() public view {
+        int24[3] memory magnitudes = [int24(1), 100, 10_000];
 
-        uint24 feeUp = hook.quoteFee(key, false);
-        uint24 feeDown = hook.quoteFee(key, true);
+        for (uint256 i; i < magnitudes.length; ++i) {
+            uint24 widen = hook.quoteFeeForDriftDelta(key, magnitudes[i]);
+            uint24 narrow = hook.quoteFeeForDriftDelta(key, -magnitudes[i]);
 
-        assertFalse(feeUp > p.baseFee && feeDown > p.baseFee, "both directions surcharged");
+            assertGe(widen, narrow, "creating drift was cheaper than repairing it");
+        }
     }
 }

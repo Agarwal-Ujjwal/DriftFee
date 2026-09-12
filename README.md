@@ -19,22 +19,48 @@ Instead the reference is a time-decayed moving average of **top-of-block** ticks
   first swap at a given timestamp therefore contributes the tick as it stood *before* any swap in
   that block. Later swaps in the same block cannot resample. This is the beginning-of-block
   checkpoint that OpenZeppelin's `AntiSandwichHook` relies on.
-- Each fold closes `min(elapsed, window) / window` of the gap, giving the reference a time constant
-  of `referenceWindow` seconds — at least 30 minutes, and independent of the chain's block time.
+- Each fold closes `min(elapsed, window) / window` of the gap, capped at `MAX_FOLD_BPS` (20%) so no
+  single sample can replace the reference. Without that cap, a pool merely *quiet* for one window
+  could have its equilibrium set outright by a single swap.
 
-So moving equilibrium requires *holding* a manipulated price across many blocks against arbitrage,
-not moving it for one transaction. `test_reference_samplesOnlyTheTopOfBlockTick` pins this down: a
-spike opened and unwound inside a block contributes nothing at all.
+So moving equilibrium requires *holding* a manipulated price across many separate timestamps against
+arbitrage, not moving it for one transaction. `test_reference_samplesOnlyTheTopOfBlockTick` pins this
+down: a spike opened and unwound inside a block contributes nothing at all.
 
-## Why the discount can't be farmed
+## How the fee is charged, and why in two parts
 
-The fee is clamped to `[minFee, maxFee]` with `minFee >= 0`, so the hook never pays a rebate. An
-attacker who pushes the price away from equilibrium to mint a discount for the reverting leg pays at
-least `baseFee` on the pushing leg over comparable volume, while the discount on the reverting leg is
-capped at `baseFee - minFee`. The round trip cannot come out ahead, before price impact and gas.
+The fee is a function of the drift a swap **creates** — `|drift after| - |drift before|`. Widening
+that gap is surcharged; narrowing it is discounted.
 
-Both halves of that argument are fuzzed as invariants — see `testFuzz_roundTripNeverRebates` and
-`testFuzz_feeAlwaysWithinConfiguredBand`.
+That quantity isn't knowable in `beforeSwap`, so charging happens in two steps:
+
+1. **`beforeSwap`** overrides the pool's fee with `minFee`, the floor everyone pays, which reaches
+   LPs through the pool's own accounting.
+2. **`afterSwap`** measures the drift actually created, prices it, takes the remainder from the
+   swap's unspecified currency, and **donates it immediately to the in-range LPs**. The hook never
+   ends a call holding a balance, so the owner never becomes the beneficiary of the fee it sets
+   (`test_fork_hookRetainsNoBalance` checks this against the real mainnet manager).
+
+### The bug this replaced
+
+The first version priced each swap on the drift it *started from*. An adversarial review broke it,
+and the reasoning is worth keeping:
+
+A swap beginning at equilibrium took the zero-drift branch and paid `baseFee` **however far it moved
+the price**. So the trade that caused the damage paid nothing for it, while the trade that repaired
+it was discounted. Since the two legs of a trade need not be the same size, a trader could pay
+`baseFee` on a small pre-move and then run a much larger main leg back at `minFee` — **+20 bps of
+free improvement**, flash-loanable, in a single transaction. Round trips came out ~41% cheaper than
+on a static pool of the same base fee, which subsidised precisely the manipulation and sandwich flow
+the hook was meant to price up.
+
+`test_premovingNoLongerBuysTheDiscount` replays that exact attack and asserts it now **loses** money
+(~16 bps worse than trading honestly, a ~36 bps swing), and `testFuzz_premovingIsNeverProfitable`
+sweeps pre-move sizes rather than trusting one. The invariant behind it —
+`testFuzz_wideningNeverCheaperThanNarrowing` — is that creating drift is never cheaper than repairing
+the same amount, for any curve.
+
+The hook still never pays a rebate: the fee is clamped to `[minFee, maxFee]` with `minFee >= 0`.
 
 ## The fee curve
 
@@ -53,10 +79,22 @@ very different drift sensitivity and window lengths, so a single curve across ev
 mispricing all but one of them. `setPoolParams` overrides a pool; `clearPoolParams` returns it to the
 default.
 
-Both paths validate against the same hard caps: every configurable fee is capped at
-`MAX_CONFIGURABLE_FEE` (10%) and every `referenceWindow` is floored at 30 minutes. So the owner can
-tune a pool to its pair, but cannot raise fees to an extractive level — nor shorten a window into
-manipulability — on pools that have already opted in.
+Both paths validate against the same hard caps. `baseFee` — and so `minFee`, since
+`minFee <= baseFee` — is capped at `MAX_BASE_FEE` (1%), while `maxFee` is capped at
+`MAX_CONFIGURABLE_FEE` (3%). The two ceilings differ deliberately: `maxFee` only ever lands on a
+drift-widening swap, whereas `baseFee`/`minFee` are what an honest trader pays unconditionally.
+`referenceWindow` is floored at 30 minutes.
+
+Those caps bound the per-swap **rate** and nothing else. They do not bound cumulative extraction, do
+not grandfather existing pools, and there is no timelock — a change applies from the next swap, and
+since the hook address is part of `PoolKey` a pool can never migrate away. The owner is not the
+beneficiary (fees accrue to LPs; there is no withdrawal path), so the worst case is griefing rather
+than self-dealing — unless the owner is also a dominant LP. **Ownership belongs behind a multisig and
+timelock, not the EOA that ran the deploy script**, which is what `OWNER` currently defaults to.
+
+An earlier version capped only `maxFee`, which left `minFee == baseFee == maxFee == cap` valid: a
+flat fee at the ceiling in both directions with the drift mechanism switched off. See
+`test_setParams_cannotFlattenPoolToASingleExtractiveRate`.
 
 Pools must be initialized with `LPFeeLibrary.DYNAMIC_FEE_FLAG`; `afterInitialize` rejects anything
 else and seeds equilibrium at the initialization tick.
@@ -65,7 +103,9 @@ else and seeds equilibrium at the initialization tick.
 
 ```
 src/DriftFee.sol                  the hook
+script/Deploy.s.sol               CREATE2 salt mining + deployment
 test/DriftFee.t.sol               unit + fuzz tests
+test/Deploy.s.t.sol               covers the deploy script
 test/DriftFee.invariants.t.sol    handler-driven invariants
 test/DriftFee.fork.t.sol          against the deployed mainnet PoolManager and real USDC/WETH
 test/utils/DriftFeeHarness.sol    exposes the fee curve and fold for direct fuzzing
@@ -149,9 +189,44 @@ One earlier finding was real and is fixed: the discount path divided down to who
 before applying `discountBps`, discarding up to a full unit. The adjustment now stays scaled until the
 final division. `test_feeFor_discountKeepsSubUnitPrecision` pins it.
 
+## Deploying
+
+A v4 hook cannot go to an arbitrary address: `BaseHook`'s constructor checks that the low 14 bits of
+its own address match its declared permissions, so deployment is a *search for a salt* rather than a
+plain `create`. `DriftFee` needs bits 12, 7, 6 and 2 — `afterInitialize`, `beforeSwap`, `afterSwap`
+and `afterSwapReturnDelta`.
+
+```sh
+forge script script/Deploy.s.sol:Deploy --rpc-url <url>              # simulate
+forge script script/Deploy.s.sol:Deploy --rpc-url <url> --broadcast --verify
+```
+
+The `PoolManager` defaults to the verified address for the chain being deployed to (Ethereum,
+Optimism, Base, Arbitrum); `POOL_MANAGER` overrides it, and an unrecognised chain reverts rather than
+falling back to a guess. `OWNER` defaults to the broadcasting account. Every curve parameter can be
+set by environment variable and is validated by the constructor, so a bad value fails before
+broadcast rather than leaving a live hook with a nonsense curve.
+
+A mainnet dry run mines a salt in a couple of thousand iterations (most recently `0x920`, giving
+`0x727fC80D…90c4`, whose low 14 bits are `0x10c4` as required) and costs roughly 0.0004 ETH to
+deploy. `test/Deploy.s.t.sol` exercises the mining and deployment path, then initializes a pool
+against the mined address and checks the hook prices both directions — an unexecuted deploy script is
+a broken deploy script.
+
+Note that four permission bits means roughly 1 in 16,384 salts qualifies, same as before: the flag
+count does not change the search difficulty, only *which* addresses qualify.
+
 ## Status
 
-Unaudited and undeployed. There is no deployment script yet: deploying a v4 hook requires mining a
-`CREATE2` salt so the address encodes the hook's permission flags, which is the next piece of work.
+Unaudited and undeployed. Reviewed adversarially (see `CROPS.md` for the trust-assumptions audit);
+the design flaw that review found has been fixed and is covered by regression tests, but the
+contract has not been re-reviewed *since* the fix, which is the obvious next step.
+
+The fee curve is also **uncalibrated**: the defaults are reasoned, not fitted, and nothing here yet
+demonstrates that the directional split leaves LPs better off than a static fee. That wants a
+backtest against historical swap flow, not another test.
+
+Ownership should be a multisig behind a timelock. `OWNER` currently defaults to the broadcasting
+EOA, which is convenient and wrong for anything real.
 
 Not production software. No warranty.

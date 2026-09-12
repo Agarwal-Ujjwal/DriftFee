@@ -226,3 +226,100 @@ restated by hand in a solc standard-json `settings` blob, because Mythril does n
 `foundry.toml` — generated here from `forge remappings` into `myth-solc.json`. Given the subcommand
 exists and is named `foundry`, the failure mode is worse than not having it: it looks like the
 supported route and gives no hint that the generic one is the working one.
+
+---
+
+## 2026-09-12 — Phase 4: deployment
+
+### 15. `vm.setEnv` writes to the process environment, which every test in the run shares
+
+A deploy script naturally reads configuration from environment variables, so testing it means
+setting them. `vm.setEnv` does not write to a per-test sandbox: it writes to the process
+environment, shared by every test in the invocation. Forge rolls back EVM state between tests; it
+does not and cannot roll back `setenv`.
+
+This surfaced as a test that passed alone and failed in the suite, with the *other* test's value:
+
+```
+[FAIL: optimism: 0x7D67...327f != 0x9a13...4Ec3] test_poolManagerTableIsCorrectPerChain()
+```
+
+`0x7D67...` is `makeAddr("customManager")` from a sibling test that sets `POOL_MANAGER`. Clearing it
+at the end of that test did not help, and neither did clearing it at the start of the reader — the
+two tests are not ordered with respect to each other in a way a test author can rely on.
+
+Two things make this sharper than ordinary shared state. There is no cheatcode to *unset* a
+variable, and setting it to the empty string does not clear it — `vm.envOr` still reports it as
+present, so a sentinel value is the only way to hand the environment back neutral. And the failure
+is order-dependent, so it appears as a flake rather than as a bug.
+
+The fix that actually holds is structural: don't let a test depend on a value another test can write.
+Splitting the override lookup from the chain table, and asserting against the table directly, removed
+the shared-state dependency entirely. But it took a confusing debugging detour to get there, and a
+warning in the `setEnv` docs that the write is process-global and not rolled back would have short-
+circuited it.
+
+### 16. Deploying a hook costs a salt search, and nothing in the toolchain says so
+
+`BaseHook`'s constructor validates that the deployer chose an address whose low 14 bits encode the
+hook's permissions, which makes `new MyHook(...)` unusable as a deployment strategy — the deployment
+path is genuinely different in kind from every other contract. `HookMiner` exists in v4-periphery and
+does the job well, but it is in `src/utils` of a package most hook projects pull in only
+transitively, and nothing in `BaseHook`'s revert (`HookAddressNotValid`) points at it.
+
+Worth noting for calibration: the search is cheap. Two flag bits means roughly 1 in 16,384 salts
+qualifies, and a mainnet dry run found one at salt `0xa27` — 2,599 iterations. Deployment came to
+about 0.0004 ETH. Both numbers are far smaller than the "mining an address" framing suggests, and
+saying so in the hook docs would save people budgeting for something expensive.
+
+---
+
+## 2026-09-12 — Phase 5: redesigning the fee rule
+
+### 17. A fee that depends on a swap's *outcome* cannot use the dynamic-fee mechanism at all
+
+v4's dynamic LP fee is set in `beforeSwap`, which means it can only ever be a function of state the
+swap has not yet touched. DriftFee needed the opposite — a fee priced on the drift a swap *creates* —
+and no amount of parameter tuning gets there, because the quantity does not exist yet at the moment
+the mechanism demands an answer.
+
+The workaround is to charge in two places: override the LP fee to the floor in `beforeSwap` so it
+flows through the pool's own accounting, then take the remainder in `afterSwap` via
+`afterSwapReturnDelta` and donate it to in-range LPs. That works, and the take-and-donate pair
+cancels so the hook never holds a balance. But it is three mechanisms (fee override, hook delta,
+donate) doing the job of one, the two components compound rather than sum, and the pool's `Swap`
+event now reports only the floor — so any offchain consumer reading `fee` from the event sees a
+number that is not what the swapper paid. That last part is a silent trap for indexers.
+
+Worth saying plainly in the hook docs: **outcome-dependent fees are not what the dynamic-fee flag is
+for**, and the `afterSwap` + donate composition is the supported shape.
+
+### 18. `BaseDynamicAfterFee` looks like the right base class and is not
+
+Its name and description ("dynamic target hook fees applied after swaps") match this use case almost
+exactly, and it already implements the transient-storage plumbing, the ERC-6909 take, and the
+handler callback that an `afterSwap` fee needs. But `_getTargetUnspecified` is invoked from
+`_beforeSwap` — the target is computed *before* the swap and merely *enforced* afterwards. So it
+carries the same pre-swap-knowledge constraint as the fee override, and cannot express a fee that
+depends on where the swap actually landed.
+
+That is only discoverable by reading the implementation; the contract-level documentation describes
+it in terms of "after swaps" throughout. A sentence noting that the target is fixed before execution
+would have saved the detour.
+
+### 19. Hook `afterSwap` implementations hit stack-too-deep almost immediately
+
+`_afterSwap` receives five parameters and returns two. Adding the pool id, the effective parameters,
+the pre- and post-swap drift, the fee, the unspecified currency and its amount was enough to exceed
+the stack with the optimizer on, at `solc 0.8.26` without `via_ir`:
+
+```
+Error: Compiler error (LValue.cpp:55): Stack too deep.
+```
+
+Splitting the body into a pricing function and a collection function fixed it, and the result reads
+better, so this is a mild push toward good structure rather than a real obstacle. But the error
+arrives with no indication of which variables are at fault, and the natural first reaction —
+enabling `via_ir` — is a heavier change than the situation warrants. Hooks are unusually prone to
+this because the callback signatures are fixed and wide; a note in the hook docs suggesting a
+split-by-default structure would land better than the compiler's suggestion.

@@ -13,8 +13,11 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 
 import {DriftFee} from "src/DriftFee.sol";
 import {BaseOverrideFee} from "uniswap-hooks/fee/BaseOverrideFee.sol";
@@ -27,7 +30,12 @@ contract DriftFeeTest is Test, Deployers {
     /// charged rather than the fee the hook merely claimed to return.
     bytes32 private constant SWAP_TOPIC = keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)");
 
-    uint160 private constant HOOK_FLAGS = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG);
+    bytes32 private constant DRIFT_FEE_TOPIC = keccak256("DriftFeeApplied(bytes32,int24,uint24,bool)");
+
+    uint160 private constant HOOK_FLAGS = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+    );
 
     int24 private constant TICK_LOWER = -3000;
     int24 private constant TICK_UPPER = 3000;
@@ -74,13 +82,13 @@ contract DriftFeeTest is Test, Deployers {
     //////////////////////////////////////////////////////////////*/
 
     function test_afterInitialize_seedsReferenceAtInitialTick() public view {
-        (int24 referenceTick, uint32 lastUpdate, bool initialized) = hook.driftState(key);
+        (int24 referenceTick, uint40 lastUpdate, bool initialized) = hook.driftState(key);
 
         (, int24 currentTick,,) = manager.getSlot0(key.toId());
 
         assertTrue(initialized, "reference not seeded");
         assertEq(referenceTick, currentTick, "reference should start at the initialization tick");
-        assertEq(lastUpdate, uint32(block.timestamp));
+        assertEq(lastUpdate, uint40(block.timestamp));
     }
 
     function test_afterInitialize_staticFeePool_reverts() public {
@@ -150,6 +158,46 @@ contract DriftFeeTest is Test, Deployers {
     function test_setParams_feeAboveHardCap_reverts() public {
         DriftFee.Params memory bad = _defaultParams();
         bad.maxFee = hook.MAX_CONFIGURABLE_FEE() + 1;
+
+        vm.prank(owner);
+        vm.expectRevert(DriftFee.InvalidParams.selector);
+        hook.setDefaultParams(bad);
+    }
+
+    /**
+     * @dev Regression for the flat-rate hole found in the CROPS audit.
+     *
+     * Validation used to require only `minFee <= baseFee <= maxFee <= MAX_CONFIGURABLE_FEE`, with no
+     * independent ceiling on `baseFee`. That made `minFee == baseFee == maxFee == MAX_CONFIGURABLE_FEE`
+     * a valid curve: `headroom` is then zero so the discount branch always returns `minFee`, and the
+     * surcharge branch always clamps to `maxFee` — a flat fee at the ceiling in both directions with
+     * the drift mechanism switched off. `MAX_BASE_FEE` closes it.
+     */
+    function test_setParams_cannotFlattenPoolToASingleExtractiveRate() public {
+        uint24 cap = hook.MAX_CONFIGURABLE_FEE();
+
+        DriftFee.Params memory flat = _defaultParams();
+        flat.minFee = cap;
+        flat.baseFee = cap;
+        flat.maxFee = cap;
+
+        vm.prank(owner);
+        vm.expectRevert(DriftFee.InvalidParams.selector);
+        hook.setDefaultParams(flat);
+
+        // The same shape via a per-pool override must be rejected too.
+        vm.prank(owner);
+        vm.expectRevert(DriftFee.InvalidParams.selector);
+        hook.setPoolParams(key, flat);
+    }
+
+    /// @dev What an honest, drift-neutral swap can be charged is capped well below `maxFee`.
+    function test_setParams_baseFeeIsBoundedBelowTheOverallCap() public {
+        assertLt(hook.MAX_BASE_FEE(), hook.MAX_CONFIGURABLE_FEE(), "base fee cap must be the tighter one");
+
+        DriftFee.Params memory bad = _defaultParams();
+        bad.baseFee = hook.MAX_BASE_FEE() + 1;
+        bad.maxFee = hook.MAX_CONFIGURABLE_FEE();
 
         vm.prank(owner);
         vm.expectRevert(DriftFee.InvalidParams.selector);
@@ -239,8 +287,10 @@ contract DriftFeeTest is Test, Deployers {
         assertEq(hook.paramsFor(key).baseFee, 100);
         assertEq(hook.defaultParams().baseFee, _defaultParams().baseFee, "default must be untouched");
 
-        // The pool charges its own curve, not the default.
-        assertEq(_swapAndReadPoolFee(true, 1e15), 100);
+        // The pool charges its own curve, not the default. The pool's own fee path carries the
+        // override's floor; the drift-dependent remainder is charged in `afterSwap`.
+        assertEq(_swapAndReadPoolFee(true, 1e15), tight.minFee);
+        assertLt(hook.feeFor(key, -100 * 1e6), _defaultParams().baseFee);
     }
 
     function test_clearPoolParams_revertsToDefault() public {
@@ -326,67 +376,44 @@ contract DriftFeeTest is Test, Deployers {
                                FEE CURVE
     //////////////////////////////////////////////////////////////*/
 
-    function test_feeFor_atEquilibrium_isBaseFee() public view {
-        (uint24 feeUp, int24 drift, bool movingAway) = hook.feeFor(key, 0, 0, false);
-        (uint24 feeDown,,) = hook.feeFor(key, 0, 0, true);
-
-        assertEq(feeUp, _defaultParams().baseFee);
-        assertEq(feeDown, _defaultParams().baseFee);
-        assertEq(drift, 0);
-        assertFalse(movingAway);
+    /// @dev A swap that leaves the distance from equilibrium unchanged is neutral.
+    function test_feeFor_neutralSwapPaysBaseFee() public view {
+        assertEq(hook.feeFor(key, 0), _defaultParams().baseFee);
     }
 
-    function test_feeFor_awayFromEquilibrium_surcharges() public view {
+    function test_feeFor_wideningIsSurcharged() public view {
         DriftFee.Params memory p = _defaultParams();
 
-        // Pool 50 ticks above equilibrium, swap pushes the tick up again.
-        (uint24 fee, int24 drift, bool movingAway) = hook.feeFor(key, 0, 50, false);
-
-        assertTrue(movingAway);
-        assertEq(drift, 50);
-        assertEq(fee, p.baseFee + 50 * p.feePerTick);
+        assertEq(hook.feeFor(key, 50 * 1e6), p.baseFee + 50 * p.feePerTick);
     }
 
-    function test_feeFor_towardEquilibrium_discounts() public view {
+    function test_feeFor_narrowingIsDiscounted() public view {
         DriftFee.Params memory p = _defaultParams();
 
-        // Pool 50 ticks above equilibrium, swap pushes the tick back down.
-        (uint24 fee, int24 drift, bool movingAway) = hook.feeFor(key, 0, 50, true);
-
-        assertFalse(movingAway);
-        assertEq(drift, 50);
-        assertEq(fee, p.baseFee - 50 * p.feePerTick);
+        assertEq(hook.feeFor(key, -50 * 1e6), p.baseFee - 50 * p.feePerTick);
     }
 
-    function test_feeFor_isSymmetricBelowEquilibrium() public view {
-        (uint24 awayAbove,,) = hook.feeFor(key, 0, 50, false);
-        (uint24 awayBelow,,) = hook.feeFor(key, 0, -50, true);
-        (uint24 towardAbove,,) = hook.feeFor(key, 0, 50, true);
-        (uint24 towardBelow,,) = hook.feeFor(key, 0, -50, false);
-
-        assertEq(awayAbove, awayBelow, "surcharge should not depend on the sign of drift");
-        assertEq(towardAbove, towardBelow, "discount should not depend on the sign of drift");
+    /// @dev The fee depends only on how much the gap changed, not on which side of equilibrium the
+    /// pool happens to sit. Widening by 50 costs the same whether the pool is above or below.
+    function test_feeFor_dependsOnMagnitudeNotSide() public view {
+        assertEq(hook.feeFor(key, 50 * 1e6), hook.feeFor(key, 50 * 1e6));
+        assertGt(hook.feeFor(key, 50 * 1e6), hook.feeFor(key, -50 * 1e6));
     }
 
     function test_feeFor_clampsAtMaxFee() public view {
-        (uint24 fee,,) = hook.feeFor(key, 0, 2000, false);
-        assertEq(fee, _defaultParams().maxFee);
+        assertEq(hook.feeFor(key, 2000 * 1e6), _defaultParams().maxFee);
     }
 
     function test_feeFor_clampsAtMinFee() public view {
-        (uint24 fee,,) = hook.feeFor(key, 0, 2000, true);
-        assertEq(fee, _defaultParams().minFee);
+        assertEq(hook.feeFor(key, -2000 * 1e6), _defaultParams().minFee);
     }
 
-    function test_feeFor_subTickDriftIsPriced() public view {
+    /// @dev Half a tick of change still moves the fee: the adjustment is computed on the scaled
+    /// value rather than on a drift already truncated to whole ticks.
+    function test_feeFor_subTickChangeIsPriced() public view {
         DriftFee.Params memory p = _defaultParams();
 
-        // Reference half a tick below the current tick: drift truncates to 0 ticks, but the
-        // adjustment is computed on the scaled value so half a tick of drift still prices.
-        (uint24 fee, int24 drift,) = hook.feeFor(key, -5e5, 0, false);
-
-        assertEq(drift, 0, "sub-tick drift truncates in the reported value");
-        assertEq(fee, p.baseFee + p.feePerTick / 2, "sub-tick drift should still move the fee");
+        assertEq(hook.feeFor(key, 5e5), p.baseFee + p.feePerTick / 2);
     }
 
     /**
@@ -394,8 +421,7 @@ contract DriftFeeTest is Test, Deployers {
      *
      * The adjustment is held in scaled units until the final division, so a sub-unit adjustment
      * survives long enough for `discountBps` to apply to it. Dividing down to whole hundredths of a
-     * bip first — the obvious way to write this — would floor 1.9 to 1, then floor 90% of 1 to 0,
-     * and return `baseFee` unchanged.
+     * bip first would floor 1.9 to 1, then floor 90% of 1 to 0, and return `baseFee` unchanged.
      */
     function test_feeFor_discountKeepsSubUnitPrecision() public view {
         DriftFee.Params memory p = _defaultParams();
@@ -403,23 +429,15 @@ contract DriftFeeTest is Test, Deployers {
         p.discountBps = 9000;
         p.minFee = 0;
 
-        // Reference a tenth of a tick above zero with the pool at tick 2: 1.9 ticks of drift, so a
-        // raw adjustment of 1.9 units, of which 90% is 1.71.
-        (uint24 fee,, bool movingAway) = hook.feeForParams(p, 1e5, 2, true);
-
-        assertFalse(movingAway);
-        assertEq(fee, p.baseFee - 1);
+        // 1.9 ticks of narrowing: a raw adjustment of 1.9 units, of which 90% is 1.71.
+        assertEq(hook.feeForParams(p, -19e5), p.baseFee - 1);
     }
 
-    function test_feeFor_respectsDiscountFactor() public {
+    function test_feeFor_respectsDiscountFactor() public view {
         DriftFee.Params memory p = _defaultParams();
         p.discountBps = 5000; // credit only half the adjustment back
 
-        vm.prank(owner);
-        hook.setDefaultParams(p);
-
-        (uint24 fee,,) = hook.feeFor(key, 0, 50, true);
-        assertEq(fee, p.baseFee - (50 * p.feePerTick) / 2);
+        assertEq(hook.feeForParams(p, -50 * 1e6), p.baseFee - (50 * p.feePerTick) / 2);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -430,12 +448,32 @@ contract DriftFeeTest is Test, Deployers {
         assertEq(hook.fold(0, 1000, 0, 1800), 0);
     }
 
-    function test_fold_fullWindow_convergesToSample() public view {
-        assertEq(hook.fold(0, 1000, 1800, 1800), 1000e6);
+    /// @dev A single sample may never replace the reference, however long the pool has been idle.
+    /// Before `MAX_FOLD_BPS` existed, a full window of silence let one swap set equilibrium outright,
+    /// which is enough to hand an attacker `maxFee` in one direction and `minFee` in the other.
+    function test_fold_singleSampleCannotReplaceTheReference() public view {
+        uint256 capBps = hook.MAX_FOLD_BPS();
+
+        // A full window elapsed still closes only `MAX_FOLD_BPS` of the gap, not all of it.
+        assertEq(hook.fold(0, 1000, 1800, 1800), int256(1000e6 * capBps / 10_000));
+        assertLt(hook.fold(0, 1000, 1800, 1800), 1000e6);
     }
 
-    function test_fold_isCappedAtOneWindow() public view {
+    function test_fold_isCappedRegardlessOfIdleTime() public view {
+        // A century of silence is worth no more than a single capped sample.
         assertEq(hook.fold(0, 1000, 100 days, 1800), hook.fold(0, 1000, 1800, 1800));
+    }
+
+    /// @dev Converging on a genuinely moved price takes repeated samples at distinct timestamps,
+    /// which is the cost an attacker must also pay.
+    function test_fold_convergesOverRepeatedSamples() public view {
+        int256 folded = 0;
+        for (uint256 i; i < 20; ++i) {
+            folded = hook.fold(folded, 1000, 1800, 1800);
+        }
+
+        assertGt(folded, 950e6, "twenty capped samples should substantially converge");
+        assertLt(folded, 1000e6, "but never quite reach the sample");
     }
 
     function test_fold_partialWindow_movesProportionally() public view {
@@ -451,35 +489,92 @@ contract DriftFeeTest is Test, Deployers {
                           SWAP INTEGRATION
     //////////////////////////////////////////////////////////////*/
 
-    function test_swap_atEquilibrium_poolChargesBaseFee() public {
-        // Guards the failure mode where a hook returns a fee without the override flag and the pool
-        // silently keeps charging its stored fee: this reads the fee off the pool's own event.
-        assertEq(_swapAndReadPoolFee(true, 1e15), _defaultParams().baseFee);
+    /**
+     * @dev The pool's own fee path charges the floor, and only the floor.
+     *
+     * Guards the failure mode where a hook returns a fee without the override flag and the pool
+     * silently keeps charging its stored fee: this reads the rate off the pool's own event. The
+     * drift-dependent remainder is charged separately in `afterSwap`, so `minFee` here is correct
+     * rather than a symptom of the override being ignored.
+     */
+    function test_swap_poolChargesTheFloorThroughItsOwnFeePath() public {
+        assertEq(_swapAndReadPoolFee(true, 1e15), _defaultParams().minFee);
     }
 
-    function test_swap_awayFromEquilibrium_costsMoreThanBase() public {
-        _swap(true, 1e16); // push the tick well below equilibrium
+    /// @dev A swap starting at equilibrium creates drift, and is charged for creating it. Under the
+    /// old pre-swap-drift rule this paid exactly `baseFee` no matter how far it moved the price.
+    function test_swap_creatingDriftFromEquilibriumIsSurcharged() public {
+        _addDeepLiquidity();
 
-        uint24 fee = _swapAndReadPoolFee(true, 1e15); // keep pushing, same direction
+        uint24 fee = _swapAndReadDriftFee(true, 2e18);
 
-        assertGt(fee, _defaultParams().baseFee, "widening drift should be surcharged");
+        assertGt(fee, _defaultParams().baseFee, "the swap that created drift was not surcharged");
     }
 
-    function test_swap_towardEquilibrium_costsLessThanBase() public {
-        _swap(true, 1e16); // push the tick well below equilibrium
+    function test_swap_narrowingDriftIsDiscounted() public {
+        _addDeepLiquidity();
 
-        uint24 fee = _swapAndReadPoolFee(false, 1e15); // swap back toward it
+        _swap(true, 2e18); // push away from equilibrium
 
-        assertLt(fee, _defaultParams().baseFee, "narrowing drift should be discounted");
+        uint24 fee = _swapAndReadDriftFee(false, 1e18); // bring it back
+
+        assertLt(fee, _defaultParams().baseFee, "narrowing drift was not discounted");
     }
 
-    function test_swap_awayCostsMoreThanToward() public {
-        _swap(true, 1e16);
+    /// @dev Creating drift is never cheaper than repairing the same amount. This is the property
+    /// whose absence made pre-moving profitable.
+    function test_swap_creatingIsNeverCheaperThanRepairing() public {
+        _addDeepLiquidity();
 
-        uint24 awayFee = hook.quoteFee(key, true);
-        uint24 towardFee = hook.quoteFee(key, false);
+        uint24 create = _swapAndReadDriftFee(true, 1e18);
+        uint24 repair = _swapAndReadDriftFee(false, 1e18);
 
-        assertGt(awayFee, towardFee);
+        assertGt(create, repair, "creating drift cost no more than repairing it");
+    }
+
+    /**
+     * @dev Exact-output swaps, which take the fee from the *input* side.
+     *
+     * Every other swap test here is exact-input, where the unspecified delta is positive. On an
+     * exact-output swap the unspecified currency is the input and its delta is negative, so this
+     * exercises the sign handling in the collection path that nothing else reaches.
+     */
+    function test_swap_exactOutputIsPricedAndCollected() public {
+        _addDeepLiquidity();
+
+        vm.recordLogs();
+        swap(key, true, 1e18, ZERO_BYTES); // positive amountSpecified == exact output
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint24 fee;
+        bool found;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter == address(hook) && logs[i].topics[0] == DRIFT_FEE_TOPIC) {
+                (, fee,) = abi.decode(logs[i].data, (int24, uint24, bool));
+                found = true;
+            }
+        }
+
+        assertTrue(found, "no fee decision for an exact-output swap");
+        assertGt(fee, _defaultParams().baseFee, "exact-output swap creating drift was not surcharged");
+        assertEq(_hookBalance(currency0) + _hookBalance(currency1), 0, "hook retained a balance");
+    }
+
+    /// @dev With nothing in range there is no one to donate the remainder to, so it is waived
+    /// rather than accrued to this contract.
+    function test_swap_withoutInRangeLiquidityWaivesTheRemainder() public {
+        (PoolKey memory emptyKey,) =
+            initPool(currency0, currency1, IHooks(address(hook)), LPFeeLibrary.DYNAMIC_FEE_FLAG, 10, SQRT_PRICE_1_1);
+
+        // No liquidity is ever added to `emptyKey`.
+        swapRouter.swap(
+            emptyKey,
+            SwapParams({zeroForOne: true, amountSpecified: -1e15, sqrtPriceLimitX96: MIN_PRICE_LIMIT}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ZERO_BYTES
+        );
+
+        assertEq(_hookBalance(currency0) + _hookBalance(currency1), 0, "hook retained a balance");
     }
 
     function test_reference_unchangedWithinOneBlock() public {
@@ -490,10 +585,10 @@ contract DriftFeeTest is Test, Deployers {
         _swap(true, 5e16);
         _swap(false, 5e16);
 
-        (int24 referenceAfter, uint32 lastUpdate,) = hook.driftState(key);
+        (int24 referenceAfter, uint40 lastUpdate,) = hook.driftState(key);
 
         assertEq(referenceAfter, referenceBefore, "equilibrium must not be movable within a block");
-        assertEq(lastUpdate, uint32(block.timestamp));
+        assertEq(lastUpdate, uint40(block.timestamp));
     }
 
     function test_reference_movesAcrossBlocksTowardTheTick() public {
@@ -514,7 +609,9 @@ contract DriftFeeTest is Test, Deployers {
         assertGt(referenceAfter, tickAfterPush, "one tenth of a window should not fully converge");
     }
 
-    function test_reference_convergesAfterFullWindow() public {
+    /// @dev The scenario that motivated `MAX_FOLD_BPS`: push the price, wait out a whole window on
+    /// a quiet pool, then land one tiny swap. Equilibrium must move partway, not all the way.
+    function test_reference_quietPoolCannotBeCapturedByOneSample() public {
         _swap(true, 1e16);
         (, int24 tickAfterPush,,) = manager.getSlot0(key.toId());
 
@@ -524,15 +621,14 @@ contract DriftFeeTest is Test, Deployers {
 
         (int24 referenceAfter,,) = hook.driftState(key);
 
-        assertEq(referenceAfter, tickAfterPush, "a full window should converge on the standing tick");
+        assertGt(referenceAfter, tickAfterPush, "one sample captured the whole reference");
+        assertEq(referenceAfter, int24(hook.fold(0, tickAfterPush, 1800, 1800) / 1e6));
     }
 
     /// @dev The sample a block contributes is the tick as of that block's first swap. A spike
     /// opened and closed inside the block contributes nothing, which is what stops a flash-loan
     /// move from steering equilibrium.
     function test_reference_samplesOnlyTheTopOfBlockTick() public {
-        // Block N: move the price and leave it there. The reference is still exactly its seeded
-        // value, because the fold only runs once `block.timestamp` has advanced.
         _swap(true, 1e16);
         (, int24 standingTick,,) = manager.getSlot0(key.toId());
         (int24 referenceBefore,,) = hook.driftState(key);
@@ -541,7 +637,6 @@ contract DriftFeeTest is Test, Deployers {
         vm.warp(block.timestamp + 180);
         vm.roll(block.number + 1);
 
-        // Block N+1: an enormous spike, unwound within the same block.
         _swap(true, 5e16);
         _swap(false, 5e16);
         (, int24 tickAfterSpike,,) = manager.getSlot0(key.toId());
@@ -549,44 +644,83 @@ contract DriftFeeTest is Test, Deployers {
 
         (int24 referenceAfter,,) = hook.driftState(key);
 
-        // Equilibrium folded in `standingTick` and nothing else: not the spike's extreme, and not
-        // where the unwind happened to land.
         assertEq(referenceAfter, int24(hook.fold(0, standingTick, 180, 1800) / 1e6));
     }
 
-    function test_quoteFee_doesNotMutateState() public {
+    function test_currentDrift_doesNotMutateState() public {
         _swap(true, 1e16);
         vm.warp(block.timestamp + 900);
 
-        (int24 referenceBefore, uint32 lastUpdateBefore,) = hook.driftState(key);
+        (int24 referenceBefore, uint40 lastUpdateBefore,) = hook.driftState(key);
 
-        hook.quoteFee(key, true);
-        hook.quoteFee(key, false);
+        hook.currentDrift(key);
+        hook.quoteFeeForDriftDelta(key, 100);
 
-        (int24 referenceAfter, uint32 lastUpdateAfter,) = hook.driftState(key);
+        (int24 referenceAfter, uint40 lastUpdateAfter,) = hook.driftState(key);
 
         assertEq(referenceAfter, referenceBefore);
         assertEq(lastUpdateAfter, lastUpdateBefore);
     }
 
-    function test_quoteFee_matchesTheFeeTheSwapPays() public {
-        _swap(true, 1e16);
+    /*//////////////////////////////////////////////////////////////
+                        REGRESSION: THE PRE-MOVE ATTACK
+    //////////////////////////////////////////////////////////////*/
 
-        uint24 quoted = hook.quoteFee(key, false);
-        assertEq(_swapAndReadPoolFee(false, 1e15), quoted);
+    /**
+     * @dev The attack that forced the redesign, now asserted to fail.
+     *
+     * The original rule priced a swap on the drift it *started from*, so a swap beginning at
+     * equilibrium paid `baseFee` however far it moved the price. Since the two legs of a trade need
+     * not be the same size, a trader could pay `baseFee` on a small pre-move to lift the pool off
+     * equilibrium and then run a much larger main leg back down at `minFee`. Measured at the time:
+     * 20 bps of free improvement for identical token0 spent.
+     *
+     * Pricing on the drift a swap *creates* removes the edge, because the pre-move now pays a
+     * surcharge for exactly the drift the main leg is later discounted for repairing.
+     */
+    function test_premovingNoLongerBuysTheDiscount() public {
+        _addDeepLiquidity();
+
+        uint256 mainLeg = 5e18;
+        uint256 preMove = 5e17;
+
+        uint256 snapshot = vm.snapshotState();
+        (int256 honest0, int256 honest1) = _measure(_sellStraight, mainLeg, 0);
+
+        vm.revertToState(snapshot);
+        (int256 gamed0, int256 gamed1) = _measure(_sellAfterPreMove, mainLeg, preMove);
+
+        assertEq(gamed0, honest0, "the two routes must spend the same token0 to be comparable");
+        assertLe(gamed1, honest1, "pre-moving still improves execution");
+
+        emit log_named_int("honest token1", honest1);
+        emit log_named_int("gamed token1 ", gamed1);
+    }
+
+    /// @dev Sweeps pre-move sizes, since a single size could miss a profitable region.
+    function testFuzz_premovingIsNeverProfitable(uint256 preMoveSeed) public {
+        _addDeepLiquidity();
+
+        uint256 mainLeg = 5e18;
+        uint256 preMove = bound(preMoveSeed, 1e16, 5e18);
+
+        uint256 snapshot = vm.snapshotState();
+        (, int256 honest1) = _measure(_sellStraight, mainLeg, 0);
+
+        vm.revertToState(snapshot);
+        (, int256 gamed1) = _measure(_sellAfterPreMove, mainLeg, preMove);
+
+        assertLe(gamed1, honest1, "found a profitable pre-move size");
     }
 
     /*//////////////////////////////////////////////////////////////
                                   FUZZ
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev The applied fee stays inside the configured band for every reachable drift and any
-    /// valid parameter set. This is what makes a discount non-extractable: the fee never goes
-    /// negative, so the hook never pays a rebate.
+    /// @dev The applied fee stays inside the configured band for every drift change and any valid
+    /// parameter set. The fee never goes negative, so the hook never pays a rebate.
     function testFuzz_feeAlwaysWithinConfiguredBand(
-        int24 referenceTick,
-        int24 currentTick,
-        bool zeroForOne,
+        int256 driftDeltaScaled,
         uint24 baseFee,
         uint24 minFee,
         uint24 maxFee,
@@ -596,65 +730,73 @@ contract DriftFeeTest is Test, Deployers {
     ) public view {
         DriftFee.Params memory p = _boundedParams(baseFee, minFee, maxFee, feePerTick, maxAdjustment, discountBps, 1800);
 
-        referenceTick = _boundTick(referenceTick);
-        currentTick = _boundTick(currentTick);
+        driftDeltaScaled = bound(driftDeltaScaled, -1_800_000 * 1e6, 1_800_000 * 1e6);
 
-        (uint24 fee,,) = hook.feeForParams(p, int256(referenceTick) * 1e6, currentTick, zeroForOne);
+        uint24 fee = hook.feeForParams(p, driftDeltaScaled);
 
         assertGe(fee, p.minFee, "fee below floor");
         assertLe(fee, p.maxFee, "fee above ceiling");
         assertLe(fee, LPFeeLibrary.MAX_LP_FEE, "fee above protocol maximum");
+
+        // The band assertions above are vacuous when `minFee == maxFee`, which is exactly the
+        // configuration that used to let the owner flatten a pool to a single extractive rate.
+        assertLe(fee, hook.MAX_CONFIGURABLE_FEE(), "fee above the hard cap");
+        assertLe(p.minFee, hook.MAX_BASE_FEE(), "an honest swap could be charged above MAX_BASE_FEE");
     }
 
-    /// @dev Drift-widening swaps never pay less than the base fee, and drift-narrowing swaps never
-    /// pay more. Without this the hook would be subsidizing the direction it means to penalize.
-    function testFuzz_directionalOrdering(int24 referenceTick, int24 currentTick, bool zeroForOne) public view {
-        referenceTick = _boundTick(referenceTick);
-        currentTick = _boundTick(currentTick);
+    /**
+     * @dev The central property of the redesign: widening drift by some amount is never cheaper
+     * than narrowing it by the same amount, for any curve.
+     *
+     * The old rule failed this in the worst possible way — a swap from equilibrium widened drift
+     * arbitrarily for the base rate, while the swap that undid it was discounted below base.
+     */
+    function testFuzz_wideningNeverCheaperThanNarrowing(
+        int256 magnitudeScaled,
+        uint24 baseFee,
+        uint24 minFee,
+        uint24 maxFee,
+        uint24 feePerTick,
+        uint24 maxAdjustment,
+        uint16 discountBps
+    ) public view {
+        DriftFee.Params memory p = _boundedParams(baseFee, minFee, maxFee, feePerTick, maxAdjustment, discountBps, 1800);
 
-        (uint24 fee,, bool movingAway) = hook.feeFor(key, int256(referenceTick) * 1e6, currentTick, zeroForOne);
-        uint24 baseFee = _defaultParams().baseFee;
+        magnitudeScaled = bound(magnitudeScaled, 0, 1_800_000 * 1e6);
 
-        if (movingAway) {
-            assertGe(fee, baseFee);
-        } else {
-            assertLe(fee, baseFee);
-        }
+        assertGe(
+            hook.feeForParams(p, magnitudeScaled),
+            hook.feeForParams(p, -magnitudeScaled),
+            "creating drift was cheaper than repairing it"
+        );
     }
 
-    /// @dev More drift means a strictly-not-cheaper surcharge and a strictly-not-dearer discount.
-    function testFuzz_feeIsMonotoneInDrift(uint24 smallDrift, uint24 extraDrift) public view {
-        int24 small = int24(uint24(bound(smallDrift, 0, 100_000)));
-        int24 large = small + int24(uint24(bound(extraDrift, 0, 100_000)));
+    /// @dev More drift created means a not-cheaper surcharge; more drift repaired means a
+    /// not-dearer discount.
+    function testFuzz_feeIsMonotoneInDriftChange(uint256 smallSeed, uint256 extraSeed) public view {
+        int256 small = int256(bound(smallSeed, 0, 100_000 * 1e6));
+        int256 large = small + int256(bound(extraSeed, 0, 100_000 * 1e6));
 
-        (uint24 awaySmall,,) = hook.feeFor(key, 0, small, false);
-        (uint24 awayLarge,,) = hook.feeFor(key, 0, large, false);
-        (uint24 towardSmall,,) = hook.feeFor(key, 0, small, true);
-        (uint24 towardLarge,,) = hook.feeFor(key, 0, large, true);
-
-        assertGe(awayLarge, awaySmall, "surcharge should not fall as drift grows");
-        assertLe(towardLarge, towardSmall, "discount should not shrink as drift grows");
+        assertGe(hook.feeFor(key, large), hook.feeFor(key, small), "surcharge fell as drift grew");
+        assertLe(hook.feeFor(key, -large), hook.feeFor(key, -small), "discount shrank as repair grew");
     }
 
-    /// @dev The core economic invariant. Pushing the price away and then reverting it can never
-    /// cost less in total than two swaps at the floor fee, so a manipulation round trip cannot be
-    /// funded by the discount it creates.
-    function testFuzz_roundTripNeverRebates(int24 driftTick, uint16 discountBps) public view {
+    /// @dev The discount never becomes a rebate: the credit never exceeds the headroom above
+    /// `minFee`, for any discount factor.
+    function testFuzz_discountNeverBecomesARebate(int256 magnitudeScaled, uint16 discountBps) public view {
         DriftFee.Params memory p = _defaultParams();
         p.discountBps = uint16(bound(discountBps, 0, 10_000));
 
-        int24 drift = _boundTick(driftTick);
+        magnitudeScaled = bound(magnitudeScaled, 0, 1_800_000 * 1e6);
 
-        (uint24 awayFee,,) = hook.feeForParams(p, 0, drift, drift >= 0 ? false : true);
-        (uint24 towardFee,,) = hook.feeForParams(p, 0, drift, drift >= 0 ? true : false);
+        uint24 narrowFee = hook.feeForParams(p, -magnitudeScaled);
 
-        assertGe(uint256(awayFee) + towardFee, uint256(p.minFee) * 2, "round trip must not be free");
-        assertGe(awayFee, towardFee, "the reverting leg must never cost more than the pushing leg");
-        assertLe(uint256(p.baseFee) - towardFee, uint256(p.baseFee) - p.minFee, "discount exceeded its headroom");
+        assertGe(narrowFee, p.minFee, "the discount breached the floor");
+        assertLe(narrowFee, p.baseFee, "narrowing cost more than the base rate");
     }
 
     /// @dev The fold is a contraction toward the sample: it lands between the old reference and the
-    /// sample, and never overshoots. A fold that overshot could be walked past the true price.
+    /// sample, and never overshoots.
     function testFuzz_foldNeverOvershoots(int24 referenceTick, int24 sampleTick, uint32 elapsed, uint32 window)
         public
         view
@@ -677,19 +819,17 @@ contract DriftFeeTest is Test, Deployers {
         }
     }
 
-    /// @dev A single fold can never close more of the gap than `elapsed / window`, which is what
-    /// bounds how fast a sustained manipulation could drag equilibrium.
-    function testFuzz_foldRespectsItsTimeConstant(int24 sampleTick, uint32 elapsed) public view {
+    /// @dev No single fold may close more than `MAX_FOLD_BPS` of the gap, however long the wait.
+    function testFuzz_foldRespectsItsCap(int24 sampleTick, uint32 elapsed, uint32 window) public view {
         sampleTick = _boundTick(sampleTick);
-        uint32 window = 1800;
-        elapsed = uint32(bound(elapsed, 0, window));
+        window = uint32(bound(window, hook.MIN_REFERENCE_WINDOW(), hook.MAX_REFERENCE_WINDOW()));
 
         int256 folded = hook.fold(0, sampleTick, elapsed, window);
 
         uint256 absFolded = uint256(folded >= 0 ? folded : -folded);
         uint256 absSample = uint256(int256(sampleTick >= 0 ? sampleTick : -sampleTick)) * 1e6;
 
-        assertLe(absFolded * window, absSample * elapsed + 1e6, "fold closed more than its share of the gap");
+        assertLe(absFolded * 10_000, absSample * hook.MAX_FOLD_BPS() + 1e6, "fold exceeded its cap");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -732,14 +872,56 @@ contract DriftFeeTest is Test, Deployers {
         uint32 referenceWindow
     ) private view returns (DriftFee.Params memory p) {
         uint24 cap = hook.MAX_CONFIGURABLE_FEE();
+        uint24 baseCap = hook.MAX_BASE_FEE();
 
-        p.minFee = uint24(bound(minFee, 0, cap));
-        p.baseFee = uint24(bound(baseFee, p.minFee, cap));
+        // `minFee <= baseFee <= MAX_BASE_FEE` and `baseFee <= maxFee <= MAX_CONFIGURABLE_FEE`,
+        // mirroring `_validatedParams`. The two ceilings differ because `maxFee` is only ever
+        // charged to a drift-widening swap, while `baseFee`/`minFee` are charged unconditionally.
+        p.minFee = uint24(bound(minFee, 0, baseCap));
+        p.baseFee = uint24(bound(baseFee, p.minFee, baseCap));
         p.maxFee = uint24(bound(maxFee, p.baseFee, cap));
         p.feePerTick = uint24(bound(feePerTick, 0, hook.MAX_FEE_PER_TICK()));
         p.maxAdjustment = uint24(bound(maxAdjustment, 0, cap));
         p.discountBps = uint16(bound(discountBps, 0, 10_000));
         p.referenceWindow = uint32(bound(referenceWindow, hook.MIN_REFERENCE_WINDOW(), hook.MAX_REFERENCE_WINDOW()));
+    }
+
+    function _hookBalance(Currency currency) private view returns (uint256) {
+        return MockERC20(Currency.unwrap(currency)).balanceOf(address(hook));
+    }
+
+    function _addDeepLiquidity() private {
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -30000, tickUpper: 30000, liquidityDelta: 1e20, salt: 0}), ZERO_BYTES
+        );
+    }
+
+    /// @dev Runs a swap route and returns the net change in this contract's two token balances.
+    function _measure(function(uint256, uint256) internal route, uint256 mainLeg, uint256 preMove)
+        private
+        returns (int256 delta0, int256 delta1)
+    {
+        uint256 before0 = MockERC20(Currency.unwrap(currency0)).balanceOf(address(this));
+        uint256 before1 = MockERC20(Currency.unwrap(currency1)).balanceOf(address(this));
+
+        route(mainLeg, preMove);
+
+        delta0 = int256(MockERC20(Currency.unwrap(currency0)).balanceOf(address(this))) - int256(before0);
+        delta1 = int256(MockERC20(Currency.unwrap(currency1)).balanceOf(address(this))) - int256(before1);
+    }
+
+    function _sellStraight(uint256 mainLeg, uint256) internal {
+        _swap(true, int256(mainLeg));
+    }
+
+    function _sellAfterPreMove(uint256 mainLeg, uint256 preMove) internal {
+        uint256 before0 = MockERC20(Currency.unwrap(currency0)).balanceOf(address(this));
+
+        _swap(false, int256(preMove)); // buy token0, lifting the tick above equilibrium
+
+        uint256 acquired = MockERC20(Currency.unwrap(currency0)).balanceOf(address(this)) - before0;
+
+        _swap(true, int256(mainLeg + acquired)); // sell it all back down, now 'drift-reducing'
     }
 
     function _swap(bool zeroForOne, int256 amount) private {
@@ -748,6 +930,22 @@ contract DriftFeeTest is Test, Deployers {
 
     /// @dev Runs a swap and returns the fee recorded on the pool manager's own `Swap` event, which
     /// reflects what the pool actually charged rather than what the hook returned.
+    /// @dev Runs a swap and returns the total fee the hook decided on, read from its own event.
+    /// The pool's `Swap` event only shows the floor, since the remainder is taken in `afterSwap`.
+    function _swapAndReadDriftFee(bool zeroForOne, int256 amount) private returns (uint24 fee) {
+        vm.recordLogs();
+        _swap(zeroForOne, amount);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter == address(hook) && logs[i].topics[0] == DRIFT_FEE_TOPIC) {
+                (, fee,) = abi.decode(logs[i].data, (int24, uint24, bool));
+                return fee;
+            }
+        }
+        revert("no DriftFeeApplied event emitted");
+    }
+
     function _swapAndReadPoolFee(bool zeroForOne, int256 amount) private returns (uint24 fee) {
         vm.recordLogs();
         _swap(zeroForOne, amount);

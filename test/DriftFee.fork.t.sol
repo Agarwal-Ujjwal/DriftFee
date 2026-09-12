@@ -61,9 +61,14 @@ contract DriftFeeForkTest is Test {
 
     string internal constant FALLBACK_RPC = "https://ethereum-rpc.publicnode.com";
 
-    uint160 internal constant HOOK_FLAGS = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG);
+    uint160 internal constant HOOK_FLAGS = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+    );
 
     bytes32 private constant SWAP_TOPIC = keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)");
+
+    bytes32 private constant DRIFT_FEE_TOPIC = keccak256("DriftFeeApplied(bytes32,int24,uint24,bool)");
 
     /// @dev USDC sorts below WETH, so USDC is currency0 and the price is WETH-per-USDC.
     int24 internal constant INITIAL_TICK = 193_380; // ~4000 USDC per WETH
@@ -161,11 +166,11 @@ contract DriftFeeForkTest is Test {
     function test_fork_seedsEquilibriumAtInitializationTick() public {
         _requireFork();
 
-        (int24 referenceTick, uint32 lastUpdate, bool initialized) = hook.driftState(key);
+        (int24 referenceTick, uint40 lastUpdate, bool initialized) = hook.driftState(key);
 
         assertTrue(initialized);
         assertEq(referenceTick, INITIAL_TICK);
-        assertEq(lastUpdate, uint32(block.timestamp));
+        assertEq(lastUpdate, uint40(block.timestamp));
     }
 
     /**
@@ -178,26 +183,42 @@ contract DriftFeeForkTest is Test {
     function test_fork_deployedManagerAppliesOverrideFee() public {
         _requireFork();
 
-        assertEq(_swapAndReadPoolFee(true, 1e10), _params().baseFee);
+        // The hook overrides the pool's stored fee with the floor; the drift-dependent remainder is
+        // charged separately in `afterSwap`. Reading this off the real manager's own event is what
+        // proves the override took effect against deployed bytecode.
+        assertEq(_swapAndReadPoolFee(true, 1e10), _params().minFee);
     }
 
-    function test_fork_awayFromEquilibriumIsSurcharged() public {
+    /// @dev The redesign's central property, against the deployed manager: the swap that creates
+    /// drift pays for creating it.
+    function test_fork_creatingDriftIsSurcharged() public {
         _requireFork();
 
-        _swap(true, 2e11); // push the tick down, away from equilibrium
+        uint24 fee = _swapAndReadDriftFee(true, 2e11);
 
         (, int24 tickAfter,,) = manager.getSlot0(key.toId());
         assertLt(tickAfter, INITIAL_TICK, "swap did not move the price");
 
-        assertGt(_swapAndReadPoolFee(true, 1e10), _params().baseFee);
+        assertGt(fee, _params().baseFee, "creating drift was not surcharged");
     }
 
-    function test_fork_towardEquilibriumIsDiscounted() public {
+    function test_fork_narrowingDriftIsDiscounted() public {
         _requireFork();
 
         _swap(true, 2e11);
 
-        assertLt(_swapAndReadPoolFee(false, 1e16), _params().baseFee);
+        assertLt(_swapAndReadDriftFee(false, 1e16), _params().baseFee, "narrowing was not discounted");
+    }
+
+    /// @dev The remainder is donated to in-range LPs, so the hook must never retain a balance.
+    function test_fork_hookRetainsNoBalance() public {
+        _requireFork();
+
+        _swap(true, 2e11);
+        _swap(false, 1e16);
+
+        assertEq(IERC20Like(USDC).balanceOf(address(hook)), 0, "hook held USDC");
+        assertEq(IERC20Like(WETH).balanceOf(address(hook)), 0, "hook held WETH");
     }
 
     /// @dev Manipulation resistance against the real manager: no amount of intra-block trading moves
@@ -291,6 +312,20 @@ contract DriftFeeForkTest is Test {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
+    }
+
+    function _swapAndReadDriftFee(bool zeroForOne, int256 amount) private returns (uint24 fee) {
+        vm.recordLogs();
+        _swap(zeroForOne, amount);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter == address(hook) && logs[i].topics[0] == DRIFT_FEE_TOPIC) {
+                (, fee,) = abi.decode(logs[i].data, (int24, uint24, bool));
+                return fee;
+            }
+        }
+        revert("no DriftFeeApplied event from the hook");
     }
 
     function _swapAndReadPoolFee(bool zeroForOne, int256 amount) private returns (uint24 fee) {
