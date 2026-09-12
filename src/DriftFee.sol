@@ -206,6 +206,15 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
 
     mapping(PoolId id => DriftState state) private _driftStates;
 
+    /// @dev Surcharge taken but not yet handed to liquidity providers, per pool and currency.
+    ///
+    /// A swap can end on a tick where no position is in range, and `donate` has nobody to pay. The
+    /// fee is held as ERC-6909 claims until a later swap finds liquidity in range, rather than
+    /// waived: the trader chooses the terminal tick via `sqrtPriceLimitX96`, so a waiver is a
+    /// discount they can award themselves, and sweeping an entire liquidity band is exactly the
+    /// trade that should be paying the most.
+    mapping(PoolId id => mapping(Currency currency => uint256 amount)) private _pendingDonations;
+
     /// @dev The equilibrium reference for `id` moved to `referenceTick` after folding in `sampleTick`.
     event ReferenceTickUpdated(PoolId indexed id, int24 referenceTick, int24 sampleTick);
 
@@ -408,9 +417,17 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         bytes calldata
     ) internal virtual override returns (bytes4, int128) {
         uint24 outstanding = _priceDriftCreated(key);
-        if (outstanding == 0) return (this.afterSwap.selector, 0);
 
-        return (this.afterSwap.selector, _collectAndDonate(key, swapParams, delta, outstanding));
+        // Casting the literal zero to `int128` is safe; the other branch returns `int128` already.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int128 hookDelta = outstanding == 0 ? int128(0) : _collect(key, swapParams, delta, outstanding);
+
+        // Flushed unconditionally, not only when this swap owes something. A swap that merely
+        // repairs drift owes nothing itself, but it is exactly the kind of swap that brings the
+        // price back into range and so makes an earlier deferred surcharge payable.
+        _flushDonations(key, key.toId());
+
+        return (this.afterSwap.selector, hookDelta);
     }
 
     /**
@@ -434,16 +451,6 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         // `minFee` was already charged by the pool's own fee path.
         outstanding = totalFee - p.minFee;
 
-        // Donating needs someone in range to receive it. A swap that consumed the outermost
-        // position leaves none, so the remainder is waived rather than accrued to this contract.
-        if (poolManager.getLiquidity(id) == 0) {
-            totalFee = p.minFee;
-            outstanding = 0;
-        }
-
-        // Emitted after the waiver, so the event reports what was charged rather than what was
-        // priced. Anything built on this event would otherwise be wrong in exactly the cases where
-        // those two diverge.
         emit DriftFeeApplied(id, (driftAfter / TICK_SCALE).toInt24(), totalFee, _abs(driftAfter) > _abs(driftBefore));
     }
 
@@ -454,38 +461,66 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
      * The positive hook delta and the donation cancel out, so this contract never ends the call
      * holding a balance and the owner never becomes the beneficiary of the fee it sets.
      */
-    function _collectAndDonate(
-        PoolKey calldata key,
-        SwapParams calldata swapParams,
-        BalanceDelta delta,
-        uint24 outstanding
-    ) private returns (int128) {
+    function _collect(PoolKey calldata key, SwapParams calldata swapParams, BalanceDelta delta, uint24 outstanding)
+        private
+        returns (int128)
+    {
         (Currency unspecified, int128 unspecifiedAmount) = (swapParams.amountSpecified < 0) == swapParams.zeroForOne
             ? (key.currency1, delta.amount1())
             : (key.currency0, delta.amount0());
 
         if (unspecifiedAmount < 0) unspecifiedAmount = -unspecifiedAmount;
 
+        // Casting to `uint128` is safe because the sign was stripped immediately above, and
+        // `TICK_SCALE` is a positive constant.
+        // forge-lint: disable-next-line(unsafe-typecast)
         uint256 feeAmount = (uint256(uint128(unspecifiedAmount)) * outstanding) / MAX_PIPS;
-        if (feeAmount == 0) return 0;
 
-        unspecified.take(poolManager, address(this), feeAmount, true);
-
-        // The returned delta is deliberately ignored: it is the debit this donation creates, which
-        // the `settle` below clears using the claims just taken. Any mismatch between the two would
-        // leave a non-zero delta and the manager would revert at the end of the unlock, so a silent
-        // discrepancy is not reachable.
-        if (unspecified == key.currency0) {
-            // slither-disable-next-line unused-return
-            poolManager.donate(key, feeAmount, 0, "");
-        } else {
-            // slither-disable-next-line unused-return
-            poolManager.donate(key, 0, feeAmount, "");
+        if (feeAmount > 0) {
+            // Credited before the claims are minted, so state is settled ahead of the external
+            // call. `take` with `claims` set mints ERC-6909 and calls back into nothing, but
+            // ordering it this way keeps the contract checks-effects-interactions throughout.
+            _pendingDonations[key.toId()][unspecified] += feeAmount;
+            unspecified.take(poolManager, address(this), feeAmount, true);
         }
 
-        unspecified.settle(poolManager, address(this), feeAmount, true);
-
         return feeAmount.toInt256().toInt128();
+    }
+
+    /**
+     * @dev Hand everything held for `id` to the liquidity providers currently in range.
+     *
+     * A no-op when nothing is owed or when nobody is in range to receive it — `donate` reverts
+     * without in-range liquidity, and a swap must not fail because of that. Whatever is owed simply
+     * waits for the next swap that finds liquidity, so a trader who steers the price out of every
+     * position defers the surcharge rather than escaping it.
+     */
+    function _flushDonations(PoolKey calldata key, PoolId id) private {
+        if (poolManager.getLiquidity(id) == 0) return;
+
+        uint256 amount0 = _pendingDonations[id][key.currency0];
+        uint256 amount1 = _pendingDonations[id][key.currency1];
+
+        if (amount0 == 0 && amount1 == 0) return;
+
+        if (amount0 > 0) delete _pendingDonations[id][key.currency0];
+        if (amount1 > 0) delete _pendingDonations[id][key.currency1];
+
+        // The returned delta is deliberately ignored: it is the debit this donation creates, which
+        // the settlements below clear using the claims already taken. Any mismatch would leave a
+        // non-zero delta and the manager would revert at the end of the unlock.
+        // slither-disable-next-line unused-return
+        poolManager.donate(key, amount0, amount1, "");
+
+        if (amount0 > 0) key.currency0.settle(poolManager, address(this), amount0, true);
+        if (amount1 > 0) key.currency1.settle(poolManager, address(this), amount1, true);
+    }
+
+    /// @notice Surcharge taken for `key` that is still waiting for in-range liquidity to receive it.
+    function pendingDonations(PoolKey calldata key) external view returns (uint256 amount0, uint256 amount1) {
+        PoolId id = key.toId();
+
+        return (_pendingDonations[id][key.currency0], _pendingDonations[id][key.currency1]);
     }
 
     /// @dev Signal `afterSwap` and its delta on top of what {BaseOverrideFee} already requires.
@@ -646,20 +681,23 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
 
         // Crossing equilibrium, i.e. the path passes through zero with real distance on both sides.
         if ((driftBefore > 0) != (driftAfter > 0) && absBefore != 0 && absAfter != 0) {
-            uint256 span = absBefore + absAfter;
-
-            // Each half is charged at its own average (half its own extent) over its share of the
-            // distance, `absBefore/span` and `absAfter/span`. The two `1/2`s and the two shares
-            // combine into `x^2 / (2 * span)`, which is why the squares appear here.
-            uint256 createdScaled = (absAfter * absAfter) / (2 * span);
-            uint256 repairedScaled = (absBefore * absBefore) / (2 * span);
-
-            return _applyAdjustments(p, createdScaled, repairedScaled);
+            // Priced as though the swap had started at equilibrium and created `absAfter`: the full
+            // surcharge for the far side, and no discount for the near one.
+            //
+            // Crediting the repaired half, or diluting the surcharge by the repaired distance,
+            // hands an attacker the same lever either way: manufacture repair distance with a small
+            // trade, then spend it against a much larger one. The legs of a trade need not be the
+            // same size, so any credit that is bought with distance but paid out on notional is
+            // exploitable. Declining to discount a swap that ends further from equilibrium than it
+            // started costs an honest trader nothing they cannot get by stopping at equilibrium and
+            // trading again.
+            return _applyAdjustments(p, _averageAdjustment(p, 0, absAfter), 0);
         }
 
         // No crossing: the distance from equilibrium moves monotonically, so the whole swap is
-        // either creating drift or repairing it, averaged over the two endpoints.
-        uint256 averageScaled = (absBefore + absAfter) / 2;
+        // either creating drift or repairing it, integrated between the two endpoints.
+        (uint256 low, uint256 high) = absAfter >= absBefore ? (absBefore, absAfter) : (absAfter, absBefore);
+        uint256 averageScaled = _averageAdjustment(p, low, high);
 
         return absAfter >= absBefore ? _applyAdjustments(p, averageScaled, 0) : _applyAdjustments(p, 0, averageScaled);
     }
@@ -678,9 +716,11 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
     {
         // Both adjustments stay scaled until the final division, so a sub-unit adjustment is not
         // rounded away before `discountBps` applies to it.
-        uint256 surcharge = _boundedAdjustment(p, createdScaled) / uint256(TICK_SCALE);
-        uint256 discount =
-            (_boundedAdjustment(p, repairedScaled) * p.discountBps) / (uint256(TICK_SCALE) * BPS_DENOMINATOR);
+        // Casting {TICK_SCALE} is safe because it is a positive constant.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 surcharge = createdScaled / uint256(TICK_SCALE);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 discount = (repairedScaled * p.discountBps) / (uint256(TICK_SCALE) * BPS_DENOMINATOR);
 
         uint256 raised = uint256(p.baseFee) + surcharge;
 
@@ -698,13 +738,40 @@ contract DriftFee is BaseOverrideFee, Ownable2Step {
         return uint24(result);
     }
 
-    /// @dev Adjustment for a drift magnitude, capped at `maxAdjustment`, and left scaled by
-    /// {TICK_SCALE} so the caller divides down only once, after any further scaling.
-    function _boundedAdjustment(Params memory p, uint256 magnitudeScaled) private pure returns (uint256) {
-        uint256 adjustmentScaled = magnitudeScaled * p.feePerTick;
-        uint256 maxAdjustmentScaled = uint256(p.maxAdjustment) * uint256(TICK_SCALE);
+    /**
+     * @dev Average adjustment over a drift interval, scaled by {TICK_SCALE}.
+     *
+     * The cap belongs *inside* the integral. Clamping a whole swap's adjustment instead makes the
+     * fee concave in the drift travelled, and Jensen's inequality then pays traders to slice: N
+     * slices are charged the mean of a concave function where one swap is charged the function of
+     * the mean, a gap of `maxAdjustment / 4` at its worst and reachable with as few as four slices.
+     * Integrating `min(maxAdjustment, feePerTick * x)` over the interval is split-invariant by
+     * construction, because an integral over a path is additive over its pieces.
+     *
+     * @param lowScaled Lower end of the drift interval, scaled by {TICK_SCALE}.
+     * @param highScaled Upper end, same scale. Must be at least `lowScaled`.
+     */
+    function _averageAdjustment(Params memory p, uint256 lowScaled, uint256 highScaled) private pure returns (uint256) {
+        if (p.feePerTick == 0) return 0;
 
-        return adjustmentScaled > maxAdjustmentScaled ? maxAdjustmentScaled : adjustmentScaled;
+        // Casting {TICK_SCALE} is safe because it is a positive constant.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 capScaled = uint256(p.maxAdjustment) * uint256(TICK_SCALE);
+
+        // Drift at which the cap starts to bind, in the same scale as the interval.
+        uint256 kneeScaled = capScaled / p.feePerTick;
+
+        // Entirely past the knee: the cap binds across the whole interval.
+        if (lowScaled >= kneeScaled) return capScaled;
+
+        // Entirely below it: the average of a linear function is its midpoint.
+        if (highScaled <= kneeScaled) return ((lowScaled + highScaled) * p.feePerTick) / 2;
+
+        // Straddling it: a trapezoid up to the knee, a rectangle beyond.
+        uint256 rising = ((kneeScaled + lowScaled) * p.feePerTick * (kneeScaled - lowScaled)) / 2;
+        uint256 flat = capScaled * (highScaled - kneeScaled);
+
+        return (rising + flat) / (highScaled - lowScaled);
     }
 
     /**

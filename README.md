@@ -39,9 +39,14 @@ That path isn't knowable in `beforeSwap`, so charging happens in two steps:
 1. **`beforeSwap`** overrides the pool's fee with `minFee`, the floor everyone pays, which reaches
    LPs through the pool's own accounting.
 2. **`afterSwap`** measures where the swap actually landed, prices the path, takes the remainder from
-   the swap's unspecified currency, and **donates it immediately to the in-range LPs**. The hook
-   never ends a call holding a balance, so the owner never becomes the beneficiary of the fee it
-   sets (`test_fork_hookRetainsNoBalance` checks this against the real mainnet manager).
+   the swap's unspecified currency, and **donates it to the in-range LPs**. The owner never becomes
+   the beneficiary of the fee it sets — there is no withdrawal path
+   (`test_fork_hookRetainsNoBalance` checks this against the real mainnet manager).
+
+   If the swap ends where no position is in range, `donate` has nobody to pay, so the surcharge is
+   *held* and paid to the next liquidity that appears. It is not waived — the trader picks the
+   terminal tick via `sqrtPriceLimitX96`, so a waiver would be a discount they could award
+   themselves, and sweeping an entire band is exactly the trade that should pay the most.
 
 ### Two rules this replaced
 
@@ -59,30 +64,38 @@ drift while the fee is a rate on notional, so slicing a trade N ways collapsed t
 `k·D·V/N`. A 40-way split came within **3.4 bps** of a pool with no hook at all — the mechanism
 simply switched off, for about $135 of gas.
 
-**The fix is arithmetic, not tuning.** Averaging over the path is a trapezoid rule, so slicing
-telescopes to the same total: for a move `0 → D` in N equal steps the drift term sums to `k·V·D/2`
-for every N, because `Σ(2i−1) = N²`. And the far endpoint is always counted, so a pre-move pays for
-the drift it creates.
+**The fix is arithmetic, not tuning.** The fee is the integral of a capped adjustment over the drift
+path, and an integral is additive over the pieces of that path — so slicing telescopes to exactly the
+same total. Two details carry the weight:
 
-Measured after the change:
+- **The cap goes *inside* the integral.** Clamping a whole swap's adjustment makes the fee concave in
+  the drift travelled, and Jensen's inequality then pays traders to slice — a gap of
+  `maxAdjustment / 4`, reachable with as few as **four** slices. Integrating
+  `min(maxAdjustment, feePerTick · x)` removes it.
+- **A swap that crosses equilibrium gets no discount.** It is priced as though it had started at
+  equilibrium and created the drift it ends with. Crediting the repaired half, or letting it dilute
+  the surcharge, both hand back the same lever: manufacture repair distance with a small trade, then
+  spend it against a large one.
 
-| attack | before | after |
-| --- | --- | --- |
-| 40-way split vs one swap | +67 bps | **+10 bps** |
-| round trip vs static pool | 39% cheaper | **39% dearer** |
-| pre-move vs honest | +20 bps | **−16 bps** |
-| crossing `+50 → −800` | discounted | **9956** (near `maxFee`) |
+Measured, against a no-hook control:
+
+| attack | v1 | v2 | now |
+| --- | --- | --- | --- |
+| 40-way split vs one swap | — | +67 bps | **0 bps** |
+| round trip vs static pool | 41% cheaper | 39% cheaper | **39% dearer** |
+| pre-move vs honest | +20 bps | −13 bps | **−13 bps** |
+| crossing `+50 → −800` | discounted | discounted | **8979** |
+| sweep a band via `sqrtPriceLimitX96` | — | fee waived | **charged** |
 
 ### Known limitations
 
-- **A residual split advantage of ~10 bps remains.** The trapezoid assumes drift moves linearly in
-  volume within a slice; on a constant-product curve it doesn't, so very fine slicing tracks the true
-  integral slightly better. Bounded and small, rather than being the whole mechanism.
-- **JIT liquidity can capture the surcharge.** The remainder is donated to whoever is in range when
-  the swap *ends*, not to the liquidity that filled it. A JIT supplying ~8% of a fill was measured
-  taking ~91% of the drift surcharge. Fixing it needs liquidity-side hooks, which this hook does not
-  implement.
-- The hook still never pays a rebate: the fee is clamped to `[minFee, maxFee]` with `minFee >= 0`.
+- **JIT liquidity can capture the surcharge.** It is donated to whoever is in range when the swap
+  *ends*, not to the liquidity that filled it. A JIT supplying ~8% of a fill was measured taking ~91%
+  of the drift surcharge. Fixing it needs liquidity-side hooks, which this hook does not implement.
+- **`maxFee` is approached, never attained.** The fee averages a capped adjustment, and an average of
+  something bounded by the cap only reaches it in the limit.
+- **The curve is uncalibrated.** The defaults are reasoned, not fitted to historical flow.
+- The hook never pays a rebate: the fee is clamped to `[minFee, maxFee]` with `minFee >= 0`.
 
 ## The fee curve
 
@@ -138,11 +151,17 @@ FEEDBACK.md                       running log of v4 development friction
 ## Development
 
 ```sh
-forge build
-forge test
-FOUNDRY_PROFILE=deep forge test              # 10k fuzz runs, 256 invariant runs
-forge test --no-match-path 'test/*.fork.t.sol'   # skip the network
+make help          # list everything
+make test          # full suite, no network
+make attacks       # the four attack regressions, with numbers
+make fork          # against the deployed mainnet PoolManager and real USDC/WETH
+make deep          # 10k fuzz runs, 256 invariant runs
+make analyze       # Slither
+make deploy-sim    # simulate a mainnet deploy, mining the CREATE2 salt
 ```
+
+`make attacks` is the quickest way to see what this hook is for: it replays the three attacks that
+broke the two earlier designs and prints the before/after numbers.
 
 `foundry.toml` pins `solc 0.8.26` and `evm_version = "cancun"` to match the v4 stack. Both pins are
 load-bearing — see `FEEDBACK.md`.

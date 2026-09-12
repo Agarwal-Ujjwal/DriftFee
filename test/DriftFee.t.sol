@@ -15,6 +15,7 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
@@ -401,8 +402,15 @@ contract DriftFeeTest is Test, Deployers {
         assertGt(hook.feeFor(key, 0, 50 * 1e6), hook.feeFor(key, 50 * 1e6, 0), "creating must cost more");
     }
 
-    function test_feeFor_clampsAtMaxFee() public view {
-        assertEq(hook.feeFor(key, 0, 2000 * 1e6), _defaultParams().maxFee);
+    /// @dev `maxFee` is approached but never attained: the fee is the *average* of a capped
+    /// adjustment over the path, and an average of something bounded by the cap only reaches it in
+    /// the limit. What matters is that it is never exceeded.
+    function test_feeFor_approachesButNeverExceedsMaxFee() public view {
+        uint24 maxFee = _defaultParams().maxFee;
+
+        assertLe(hook.feeFor(key, 0, 2000 * 1e6), maxFee);
+        assertLe(hook.feeFor(key, 0, 800_000 * 1e6), maxFee);
+        assertGt(hook.feeFor(key, 0, 800_000 * 1e6), maxFee - 10, "should be within a hair of the cap");
     }
 
     function test_feeFor_clampsAtMinFee() public view {
@@ -562,20 +570,57 @@ contract DriftFeeTest is Test, Deployers {
         assertEq(_hookBalance(currency0) + _hookBalance(currency1), 0, "hook retained a balance");
     }
 
-    /// @dev With nothing in range there is no one to donate the remainder to, so it is waived
-    /// rather than accrued to this contract.
-    function test_swap_withoutInRangeLiquidityWaivesTheRemainder() public {
-        (PoolKey memory emptyKey,) =
+    /**
+     * @dev The surcharge must not be waivable by choosing where the swap ends.
+     *
+     * A swap can finish on a tick with no position in range, where `donate` has nobody to pay. The
+     * remainder used to be waived there — but the trader picks the terminal tick via
+     * `sqrtPriceLimitX96`, so that was a discount they could award themselves, and sweeping an
+     * entire liquidity band is precisely the trade that should pay the most. It is now held and
+     * paid out to the next liquidity that shows up.
+     */
+    function test_swap_surchargeIsDeferredNotWaivedWhenNobodyIsInRange() public {
+        (PoolKey memory poolKey,) =
             initPool(currency0, currency1, IHooks(address(hook)), LPFeeLibrary.DYNAMIC_FEE_FLAG, 10, SQRT_PRICE_1_1);
 
-        // No liquidity is ever added to `emptyKey`.
+        // A single narrow band; the swap below sweeps straight past it.
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey, ModifyLiquidityParams({tickLower: -100, tickUpper: 100, liquidityDelta: 1e18, salt: 0}), ZERO_BYTES
+        );
+
         swapRouter.swap(
-            emptyKey,
-            SwapParams({zeroForOne: true, amountSpecified: -1e15, sqrtPriceLimitX96: MIN_PRICE_LIMIT}),
+            poolKey,
+            // The attack shape: park the limit just past the band's lower edge, so the swap sweeps
+            // the whole band and stops where nothing is in range.
+            SwapParams({
+                zeroForOne: true, amountSpecified: -1e17, sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(-200)
+            }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ZERO_BYTES
         );
 
+        assertEq(manager.getLiquidity(poolKey.toId()), 0, "test needs the band to have been swept");
+
+        (uint256 pending0, uint256 pending1) = hook.pendingDonations(poolKey);
+        assertGt(pending0 + pending1, 0, "the surcharge was waived instead of held");
+
+        // Liquidity returns around wherever the sweep left the price, and the next swap hands the
+        // held surcharge over.
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({tickLower: -1000, tickUpper: 1000, liquidityDelta: 1e18, salt: 0}),
+            ZERO_BYTES
+        );
+        assertGt(manager.getLiquidity(poolKey.toId()), 0, "new liquidity should be in range");
+        swapRouter.swap(
+            poolKey,
+            SwapParams({zeroForOne: false, amountSpecified: -1e15, sqrtPriceLimitX96: MAX_PRICE_LIMIT}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ZERO_BYTES
+        );
+
+        (pending0, pending1) = hook.pendingDonations(poolKey);
+        assertEq(pending0 + pending1, 0, "held surcharge was never paid out");
         assertEq(_hookBalance(currency0) + _hookBalance(currency1), 0, "hook retained a balance");
     }
 
@@ -693,7 +738,10 @@ contract DriftFeeTest is Test, Deployers {
         assertGt(forty, one, "expected some residual gain from slicing");
 
         uint256 gainBps = (forty - one) * 10_000 / one;
-        emit log_named_uint("40-slice gain, bps", gainBps);
+
+        emit log_named_uint("  one swap, token1 out   ", one);
+        emit log_named_uint("  40 slices, token1 out  ", forty);
+        emit log_named_uint("  slicing gain, bps (was 67)", gainBps);
 
         assertLt(gainBps, 25, "slicing recovered too much of the surcharge");
     }
@@ -710,6 +758,10 @@ contract DriftFeeTest is Test, Deployers {
         vm.revertToState(snapshot);
         uint256 control = _roundTripCost(staticKey, 1, 2e16);
 
+        emit log_named_uint("  round trip on DriftFee  ", sliced);
+        emit log_named_uint("  round trip on static 0.3%", control);
+        emit log_named_uint("  DriftFee dearer by, pct (was 39% cheaper)", (sliced - control) * 100 / control);
+
         assertGt(sliced, control, "round trip is cheaper here than with no hook at all");
     }
 
@@ -720,19 +772,25 @@ contract DriftFeeTest is Test, Deployers {
      * *repair* and was discounted, despite creating 800 ticks of fresh drift. Splitting the path at
      * the crossing prices each half in its own direction.
      */
-    function test_crossingEquilibriumIsPricedOnBothHalves() public view {
+    function test_crossingEquilibriumIsPricedOnBothHalves() public {
         DriftFee.Params memory p = _defaultParams();
 
-        // Creates far more than it repairs.
+        emit log_named_uint("  base fee                              ", p.baseFee);
+        emit log_named_uint("  repair 50, create 800 (was discounted)", hook.quoteFeeForPath(key, 50, -800));
+        emit log_named_uint("  repair 800, create 50                 ", hook.quoteFeeForPath(key, 800, -50));
+        emit log_named_uint("  pure repair 800 -> 0 (still discounted)", hook.quoteFeeForPath(key, 800, 0));
+
+        // A crossing is priced on the drift it leaves behind, so both of these are surcharged in
+        // proportion to how far past equilibrium they end up.
         assertGt(hook.quoteFeeForPath(key, 50, -800), p.baseFee, "far-side drift was not surcharged");
-
-        // Repairs far more than it creates.
-        assertLt(hook.quoteFeeForPath(key, 800, -50), p.baseFee, "a genuine repair was not discounted");
-
-        // Near-symmetric: the two halves roughly cancel, which is the correct neutral answer.
-        assertApproxEqAbs(
-            uint256(hook.quoteFeeForPath(key, 395, -392)), uint256(p.baseFee), 100, "symmetric swing was not neutral"
+        assertGt(
+            hook.quoteFeeForPath(key, 50, -800),
+            hook.quoteFeeForPath(key, 800, -50),
+            "creating 800 should cost more than creating 50"
         );
+
+        // No crossing, so a genuine repair still earns its discount.
+        assertLt(hook.quoteFeeForPath(key, 800, 0), p.baseFee, "a pure repair was not discounted");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -766,8 +824,9 @@ contract DriftFeeTest is Test, Deployers {
         assertEq(gamed0, honest0, "the two routes must spend the same token0 to be comparable");
         assertLe(gamed1, honest1, "pre-moving still improves execution");
 
-        emit log_named_int("honest token1", honest1);
-        emit log_named_int("gamed token1 ", gamed1);
+        emit log_named_int("  honest route, token1 out", honest1);
+        emit log_named_int("  pre-move route, token1 out", gamed1);
+        emit log_named_int("  pre-move advantage, bps (was +20)", (gamed1 - honest1) * 10_000 / honest1);
     }
 
     /// @dev Sweeps pre-move sizes, since a single size could miss a profitable region.
