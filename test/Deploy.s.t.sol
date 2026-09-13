@@ -125,6 +125,15 @@ contract DeployScriptTest is Test, Deployers {
 
         vm.chainId(42161);
         assertEq(harness.defaultPoolManager(), 0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32, "arbitrum");
+
+        vm.chainId(11155111);
+        assertEq(harness.defaultPoolManager(), 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543, "sepolia");
+
+        vm.chainId(84532);
+        assertEq(harness.defaultPoolManager(), 0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408, "base sepolia");
+
+        vm.chainId(421614);
+        assertEq(harness.defaultPoolManager(), 0xFB3e0C6F74eB1a21CC1Da29aeC80D2Dfe6C9a317, "arbitrum sepolia");
     }
 
     /**

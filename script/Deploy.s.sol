@@ -112,6 +112,11 @@ contract Deploy is Script {
         if (block.chainid == 8453) return 0x498581fF718922c3f8e6A244956aF099B2652b2b; // Base
         if (block.chainid == 42161) return 0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32; // Arbitrum
 
+        // Testnets. Same runtime code as mainnet, same operator.
+        if (block.chainid == 11155111) return 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543; // Sepolia
+        if (block.chainid == 84532) return 0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408; // Base Sepolia
+        if (block.chainid == 421614) return 0xFB3e0C6F74eB1a21CC1Da29aeC80D2Dfe6C9a317; // Arbitrum Sepolia
+
         revert UnsupportedChain(block.chainid);
     }
 
